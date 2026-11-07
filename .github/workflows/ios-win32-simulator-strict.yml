@@ -1,0 +1,779 @@
+name: Fase 61 - enlace estricto con capa Win32 iOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rsx-14-simulator:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Obtener repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar toolkit y parches iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/rsx-simulator-14
+          xcodebuild -version > build/rsx-simulator-14/xcode.txt
+          xcrun --sdk iphonesimulator --show-sdk-version >> build/rsx-simulator-14/xcode.txt
+          git clone --quiet https://github.com/erikomis/ps3recomp.git toolkit
+          git -C toolkit checkout --quiet 675ed394
+          git clone --quiet --depth 1 https://github.com/erikomis/pes2013-recomp.git pes2013-upstream
+          git -C toolkit apply ../pes2013-upstream/patches/ps3recomp-675ed39-pes13.patch
+          git -C toolkit apply ../.ci/patches/ios-metal-guard.patch
+          git -C toolkit apply ../.ci/patches/ios-metal-layer-bridge.patch
+          python3 - <<'PYFIX'
+          from pathlib import Path
+          p=Path('toolkit/libs/video/rsx_metal_backend.m')
+          s=p.read_text()
+          replacements={
+            '#include "../input/host_input_cocoa.h"': '#include "../../include/ps3emu/host_input.h"\n#if !TARGET_OS_IPHONE\n#include "../input/host_input_cocoa.h"\n#endif',
+            'static NSWindow*           s_window;': '#if !TARGET_OS_IPHONE\nstatic NSWindow*           s_window;\n#endif'
+          }
+          for old, new in replacements.items():
+            if s.count(old)!=1: raise RuntimeError(f'No se encontro una sola vez: {old}')
+            s=s.replace(old,new)
+          p.write_text(s)
+          PYFIX
+          git -C toolkit status --short > build/rsx-simulator-14/patched-files.txt
+
+      - name: Compilar once fuentes RSX para simulador ARM64
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$PWD/build/rsx-simulator-14"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          printf 'source\tstatus\texit_code\n' > "$D/summary.tsv"
+          SOURCES=(
+            rsx_metal_backend.m
+            rsx_draw_engine.c
+            rsx_texture_layout.c
+            rsx_fp_decompiler.c
+            rsx_vp_decompiler.c
+            rsx_vertex_compact.c
+            rsx_dispatch.c
+            cellGcmSys.c
+            rsx_vertex_fetch.c
+            rsx_commands.c
+            rsx_shader_msl.cpp
+          )
+          for SRC in "${SOURCES[@]}"; do
+            STEM="${SRC%.*}"
+            OBJ="$D/$STEM.o"
+            LOG="$D/$STEM.log"
+            if [[ "$SRC" == *.cpp ]]; then
+              COMPILER=clang++
+              STD=-std=c++17
+            else
+              COMPILER=clang
+              STD=-std=gnu11
+            fi
+            if xcrun --sdk iphonesimulator "$COMPILER" \
+               -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+               "$STD" -fblocks -c \
+               -I toolkit/include -I toolkit/include/ps3emu \
+               -I toolkit/libs/video -I toolkit/libs/input -I toolkit/runtime \
+               "toolkit/libs/video/$SRC" -o "$OBJ" > "$LOG" 2>&1; then
+              CODE=0; STATUS=OK
+              file "$OBJ" > "$D/$STEM.file.txt"
+              xcrun nm -g "$OBJ" > "$D/$STEM.symbols.txt" 2>&1 || true
+            else
+              CODE=$?; STATUS=FAIL
+              echo "::warning::$SRC no compilo (exit $CODE)"
+              tail -n 15 "$LOG" || true
+            fi
+            printf '%s\t%s\t%s\n' "$SRC" "$STATUS" "$CODE" >> "$D/summary.tsv"
+          done
+          cat "$D/summary.tsv"
+
+      - name: Enlace parcial de once objetos del simulador
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$PWD/build/rsx-simulator-14"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          STEMS=(rsx_metal_backend rsx_draw_engine rsx_texture_layout \
+            rsx_fp_decompiler rsx_vp_decompiler rsx_vertex_compact \
+            rsx_dispatch cellGcmSys rsx_vertex_fetch rsx_commands rsx_shader_msl)
+          OBJS=()
+          for STEM in "${STEMS[@]}"; do
+            OBJ="$D/$STEM.o"
+            if [ ! -s "$OBJ" ]; then
+              echo "MERGE11_SIM_EXIT_CODE=SKIPPED_MISSING_OBJECTS" | tee "$D/result.txt"
+              echo "Missing: $OBJ" >> "$D/result.txt"
+              exit 0
+            fi
+            OBJS+=("$OBJ")
+          done
+          if xcrun --sdk iphonesimulator clang++ \
+             -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+             -r "${OBJS[@]}" -o "$D/rsx-eleven-simulator-arm64.o" \
+             > "$D/merge.log" 2>&1; then
+            echo 'MERGE11_SIM_EXIT_CODE=0' | tee "$D/result.txt"
+            file "$D/rsx-eleven-simulator-arm64.o" > "$D/combined.file.txt"
+            xcrun nm -g -u "$D/rsx-eleven-simulator-arm64.o" > "$D/unresolved.txt" 2>&1 || true
+            xcrun nm -g "$D/rsx-eleven-simulator-arm64.o" > "$D/combined-symbols.txt" 2>&1 || true
+          else
+            echo 'MERGE11_SIM_EXIT_CODE=1' | tee "$D/result.txt"
+            tail -n 40 "$D/merge.log" || true
+          fi
+          echo 'Solo compilacion y enlace parcial; no se inicializa RSX ni se ejecuta PES 2013.' > "$D/scope.txt"
+
+      - name: Compilar tres proveedores RSX adicionales y enlazar catorce objetos
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$PWD/build/rsx-simulator-14"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          printf 'source\tstatus\texit_code\n' > "$D/additional-summary.tsv"
+          SOURCES=(
+            toolkit/libs/video/rsx_live_draw.c
+            toolkit/libs/video/sys_rsx.c
+            toolkit/runtime/milestone.c
+          )
+          EXTRA=()
+          for SRC in "${SOURCES[@]}"; do
+            STEM="$(basename "${SRC%.*}")"
+            OBJ="$D/$STEM.o"
+            LOG="$D/$STEM.log"
+            if xcrun --sdk iphonesimulator clang \
+              -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+              -std=gnu11 -fblocks -c \
+              -I toolkit/include -I toolkit/include/ps3emu \
+              -I toolkit/libs/video -I toolkit/libs/input \
+              -I toolkit/runtime -I toolkit/runtime/spu -I toolkit/runtime/ppu \
+              "$SRC" -o "$OBJ" > "$LOG" 2>&1; then
+              STATUS=OK; CODE=0
+              EXTRA+=("$OBJ")
+              xcrun nm -g "$OBJ" > "$D/$STEM.symbols.txt" 2>&1 || true
+            else
+              CODE=$?; STATUS=FAIL
+              echo "::warning::$SRC no compilo (ver $STEM.log)"
+              tail -n 12 "$LOG" || true
+            fi
+            printf '%s\t%s\t%s\n' "$SRC" "$STATUS" "$CODE" >> "$D/additional-summary.tsv"
+          done
+          cat "$D/additional-summary.tsv"
+          BASE="$D/rsx-eleven-simulator-arm64.o"
+          if [ ! -s "$BASE" ] || [ "${#EXTRA[@]}" -ne 3 ]; then
+            echo 'MERGE14_SIM_EXIT_CODE=SKIPPED_MISSING_OBJECTS' | tee "$D/phase51-result.txt"
+            exit 0
+          fi
+          if xcrun --sdk iphonesimulator clang++ \
+            -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+            -r "$BASE" "${EXTRA[@]}" -o "$D/rsx-fourteen-simulator-arm64.o" \
+            > "$D/merge14.log" 2>&1; then
+            echo 'MERGE14_SIM_EXIT_CODE=0' | tee "$D/phase51-result.txt"
+            file "$D/rsx-fourteen-simulator-arm64.o" > "$D/combined14.file.txt"
+            xcrun nm -g -u "$D/rsx-fourteen-simulator-arm64.o" > "$D/unresolved14.txt" 2>&1 || true
+            python3 - <<'PYCOMPARE'
+          from pathlib import Path
+          d=Path('build/rsx-simulator-14')
+          before={s.strip() for s in (d/'unresolved.txt').read_text().splitlines() if s.strip()}
+          after={s.strip() for s in (d/'unresolved14.txt').read_text().splitlines() if s.strip()}
+          (d/'resolved-by-new-modules.txt').write_text('\n'.join(sorted(before-after))+'\n')
+          (d/'newly-required.txt').write_text('\n'.join(sorted(after-before))+'\n')
+          (d/'phase51-summary.txt').write_text(f'Before={len(before)}\nAfter={len(after)}\nResolved={len(before-after)}\nNew={len(after-before)}\n')
+          PYCOMPARE
+          else
+            echo 'MERGE14_SIM_EXIT_CODE=1' | tee "$D/phase51-result.txt"
+            tail -n 30 "$D/merge14.log" || true
+          fi
+
+      - name: Fase 52 - enlace estricto de RSX con frameworks iOS
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$PWD/build/rsx-simulator-14"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          OBJ="$D/rsx-fourteen-simulator-arm64.o"
+          mkdir -p "$D/phase52"
+          OUT="$D/phase52"
+          if [ ! -s "$OBJ" ]; then
+            echo "STRICT_SIM14_LINK_EXIT_CODE=SKIPPED_NO_OBJECT" > "$OUT/result.txt"
+            exit 0
+          fi
+          # Linking a dylib with unresolved-symbol errors enabled is intentional.
+          # No artificial stubs or actual game execution here.
+          if xcrun --sdk iphonesimulator clang++ \
+              -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+              -dynamiclib -Wl,-undefined,error \
+              "$OBJ" \
+              -framework Foundation -framework UIKit -framework Metal \
+              -framework QuartzCore -framework CoreFoundation \
+              -lobjc -lc++ \
+              -o "$OUT/rsx14-link-test.dylib" > "$OUT/link.log" 2>&1; then
+            echo "STRICT_SIM14_LINK_EXIT_CODE=0" > "$OUT/result.txt"
+            file "$OUT/rsx14-link-test.dylib" > "$OUT/binary-info.txt"
+          else
+            CODE=$?
+            echo "STRICT_SIM14_LINK_EXIT_CODE=$CODE" > "$OUT/result.txt"
+          fi
+          python3 - <<'PY52'
+          from pathlib import Path
+          import re
+          d=Path('build/rsx-simulator-14/phase52')
+          log=(d/'link.log').read_text(errors='replace')
+          # Collect the linker lines identifying unresolved symbol names.
+          # The complete linker log is retained for independent verification.
+          pattern=re.compile(r'^\s*["\'`]?(_[A-Za-z0-9_$]+)["\'`]?\s*,?\s+referenced from:',re.M)
+          names=set(pattern.findall(log))
+          (d/'undefined-in-link.txt').write_text('\n'.join(sorted(names))+('\n' if names else ''))
+          status=(d/'result.txt').read_text().strip()
+          (d/'summary.txt').write_text(status+'\nParsedUndefinedSymbolNames='+str(len(names))+'\nStrict link only; this is not game execution.\n')
+          print((d/'summary.txt').read_text())
+          PY52
+
+      - name: Fase 53 - compilar proveedores de runtime para simulador y comparar enlaces
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$PWD/build/rsx-simulator-14/phase53"
+          mkdir -p "$D"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          BASE="$PWD/build/rsx-simulator-14/rsx-fourteen-simulator-arm64.o"
+          printf 'source\tstatus\texit_code\tobject\n' > "$D/compile-summary.tsv"
+          SOURCES=(
+            toolkit/libs/misc/cellAvconfExt.c
+            toolkit/runtime/host/host_stubs.c
+            toolkit/runtime/spu/spu_channels.c
+            toolkit/runtime/spu/spu_coherency.c
+            toolkit/runtime/syscalls/sys_event.c
+          )
+          OBJS=()
+          IDX=0
+          for SRC in "${SOURCES[@]}"; do
+            IDX=$((IDX+1))
+            STEM="$(basename "${SRC%.*}")"
+            OBJ="$D/${IDX}-${STEM}.o"
+            LOG="$D/${IDX}-${STEM}.log"
+            if xcrun --sdk iphonesimulator clang \
+              -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+              -std=gnu11 -fblocks -c \
+              -I toolkit/include -I toolkit/include/ps3emu \
+              -I toolkit/libs/video -I toolkit/libs/input \
+              -I toolkit/runtime -I toolkit/runtime/spu -I toolkit/runtime/ppu \
+              "$SRC" -o "$OBJ" > "$LOG" 2>&1; then
+              CODE=0; STATUS=OK
+              OBJS+=("$OBJ")
+              xcrun nm -g "$OBJ" > "$D/${IDX}-${STEM}.symbols.txt" 2>&1 || true
+            else
+              CODE=$?; STATUS=FAIL
+              echo "::warning::No compilo $SRC (exit=$CODE)"
+              tail -n 8 "$LOG" || true
+            fi
+            printf '%s\t%s\t%s\t%s\n' "$SRC" "$STATUS" "$CODE" "$(basename "$OBJ")" >> "$D/compile-summary.tsv"
+          done
+          if [ ! -s "$BASE" ] || [ "${#OBJS[@]}" -eq 0 ]; then
+            echo 'MERGE53_EXIT_CODE=SKIPPED' > "$D/result.txt"
+            exit 0
+          fi
+          if xcrun --sdk iphonesimulator clang++ \
+            -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+            -r "$BASE" "${OBJS[@]}" -o "$D/rsx-with-providers-simulator.o" \
+            > "$D/merge.log" 2>&1; then
+            echo 'MERGE53_EXIT_CODE=0' > "$D/result.txt"
+            xcrun nm -g -u "$D/rsx-with-providers-simulator.o" > "$D/unresolved-objects.txt" 2>&1 || true
+          else
+            CODE=$?
+            echo "MERGE53_EXIT_CODE=$CODE" > "$D/result.txt"
+            tail -n 25 "$D/merge.log" || true
+            exit 0
+          fi
+          if xcrun --sdk iphonesimulator clang++ \
+            -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+            -dynamiclib -Wl,-undefined,error \
+            "$D/rsx-with-providers-simulator.o" \
+            -framework Foundation -framework UIKit -framework Metal \
+            -framework QuartzCore -framework CoreFoundation \
+            -lobjc -lc++ \
+            -o "$D/runtime53-test.dylib" > "$D/link.log" 2>&1; then
+            echo 'STRICT53_LINK_EXIT_CODE=0' >> "$D/result.txt"
+          else
+            CODE=$?
+            echo "STRICT53_LINK_EXIT_CODE=$CODE" >> "$D/result.txt"
+          fi
+          python3 - <<'PY53'
+          from pathlib import Path
+          import re
+          d=Path('build/rsx-simulator-14/phase53')
+          old=Path('build/rsx-simulator-14/phase52/undefined-in-link.txt')
+          old_names={x.lstrip('_') for x in old.read_text().splitlines() if x.strip()} if old.exists() else set()
+          log=(d/'link.log').read_text(errors='replace') if (d/'link.log').exists() else ''
+          pattern=re.compile(r'^\s*["\'`]?(_[A-Za-z0-9_$]+)["\'`]?\s*,?\s+referenced from:',re.M)
+          new_names={x.lstrip('_') for x in pattern.findall(log)}
+          (d/'undefined-in-link.txt').write_text('\n'.join(sorted(new_names))+('\n' if new_names else ''))
+          (d/'resolved-from-phase52.txt').write_text('\n'.join(sorted(old_names-new_names))+('\n' if old_names-new_names else ''))
+          (d/'new-since-phase52.txt').write_text('\n'.join(sorted(new_names-old_names))+('\n' if new_names-old_names else ''))
+          summary=(f'Phase52Undefined={len(old_names)}\nPhase53Undefined={len(new_names)}\n'
+                   f'ResolvedFrom52={len(old_names-new_names)}\nNewSince52={len(new_names-old_names)}\n'
+                   'This test does not initialize the RSX backend or execute PES 2013.\n')
+          (d/'summary.txt').write_text(summary)
+          print(summary)
+          PY53
+          cat "$D/result.txt"
+
+      - name: Fase 54 - compilar ocho modulos SPU y comparar enlace
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$PWD/build/rsx-simulator-14/phase54"
+          mkdir -p "$D"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          BASE="$PWD/build/rsx-simulator-14/phase53/rsx-with-providers-simulator.o"
+          printf 'source\tstatus\texit_code\tobject\n' > "$D/compile-summary.tsv"
+          SOURCES=(
+            toolkit/runtime/spu/spu_drain.c
+            toolkit/runtime/spu/spu_interp.c
+            toolkit/runtime/spu/spu_workload.c
+            toolkit/runtime/spu/spurs_policy.c
+            toolkit/runtime/syscalls/sys_ppu_thread.c
+            toolkit/runtime/lv2_register.c
+            toolkit/libs/spurs/cellSpurs.c
+            toolkit/runtime/spu/spurs_job.c
+          )
+          # Search for relocated files rather than silently assuming their paths.
+          OBJS=()
+          IDX=0
+          for REQUESTED in "${SOURCES[@]}"; do
+            IDX=$((IDX+1))
+            NAME="$(basename "$REQUESTED")"
+            SRC="$REQUESTED"
+            if [ ! -f "$SRC" ]; then
+              FOUND="$(find toolkit -type f -name "$NAME" | head -n 1)"
+              if [ -n "$FOUND" ]; then SRC="$FOUND"; fi
+            fi
+            OBJ="$D/${IDX}-${NAME%.*}.o"
+            LOG="$D/${IDX}-${NAME%.*}.log"
+            if [ ! -f "$SRC" ]; then
+              printf '%s\tMISSING\tNA\t%s\n' "$REQUESTED" "$(basename "$OBJ")" >> "$D/compile-summary.tsv"
+              continue
+            fi
+            if xcrun --sdk iphonesimulator clang \
+              -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+              -std=gnu11 -fblocks -c \
+              -I toolkit/include -I toolkit/include/ps3emu \
+              -I toolkit/libs/video -I toolkit/libs/input \
+              -I toolkit/runtime -I toolkit/runtime/spu -I toolkit/runtime/ppu \
+              "$SRC" -o "$OBJ" > "$LOG" 2>&1; then
+              CODE=0; STATUS=OK
+              OBJS+=("$OBJ")
+              xcrun nm -g "$OBJ" > "$D/${IDX}-${NAME%.*}.symbols.txt" 2>&1 || true
+            else
+              CODE=$?; STATUS=FAIL
+              echo "::warning::No compilo $SRC (exit=$CODE)"
+              tail -n 8 "$LOG" || true
+            fi
+            printf '%s\t%s\t%s\t%s\n' "$SRC" "$STATUS" "$CODE" "$(basename "$OBJ")" >> "$D/compile-summary.tsv"
+          done
+          cat "$D/compile-summary.tsv"
+          if [ ! -s "$BASE" ] || [ "${#OBJS[@]}" -ne 8 ]; then
+            echo 'MERGE54_EXIT_CODE=SKIPPED_NOT_ALL_MODULES_COMPILED' > "$D/result.txt"
+            echo "Compiled=${#OBJS[@]}/8" >> "$D/result.txt"
+            exit 0
+          fi
+          if xcrun --sdk iphonesimulator clang++ \
+            -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+            -r "$BASE" "${OBJS[@]}" -o "$D/rsx-spu-simulator.o" \
+            > "$D/merge.log" 2>&1; then
+            echo 'MERGE54_EXIT_CODE=0' > "$D/result.txt"
+            file "$D/rsx-spu-simulator.o" > "$D/object-info.txt"
+          else
+            CODE=$?
+            echo "MERGE54_EXIT_CODE=$CODE" > "$D/result.txt"
+            tail -n 25 "$D/merge.log" || true
+            exit 0
+          fi
+          if xcrun --sdk iphonesimulator clang++ \
+            -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+            -dynamiclib -Wl,-undefined,error \
+            "$D/rsx-spu-simulator.o" \
+            -framework Foundation -framework UIKit -framework Metal \
+            -framework QuartzCore -framework CoreFoundation \
+            -lobjc -lc++ \
+            -o "$D/runtime54-test.dylib" > "$D/link.log" 2>&1; then
+            echo 'STRICT54_LINK_EXIT_CODE=0' >> "$D/result.txt"
+          else
+            CODE=$?
+            echo "STRICT54_LINK_EXIT_CODE=$CODE" >> "$D/result.txt"
+          fi
+          python3 - <<'PY54'
+          from pathlib import Path
+          import re
+          d=Path('build/rsx-simulator-14/phase54')
+          old=Path('build/rsx-simulator-14/phase53/undefined-in-link.txt')
+          before=set(old.read_text().splitlines()) if old.exists() else set()
+          log=(d/'link.log').read_text(errors='replace') if (d/'link.log').exists() else ''
+          names=set(re.findall(r'^\s*["\'`]?_([A-Za-z0-9_$]+)["\'`]?\s*,?\s+referenced from:',log,re.M))
+          for filename,items in [('undefined-in-link.txt',names),('resolved-from-phase53.txt',before-names),('new-since-phase53.txt',names-before)]:
+            (d/filename).write_text('\n'.join(sorted(items))+('\n' if items else ''))
+          report=f'Before={len(before)}\nAfter={len(names)}\nResolved={len(before-names)}\nNew={len(names-before)}\n'
+          (d/'summary.txt').write_text(report)
+          print(report)
+          PY54
+          cat "$D/result.txt"
+
+      - name: Fase 56 - compilar proveedores detectados en mapa de simbolos
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$PWD/build/rsx-simulator-14/phase56"
+          mkdir -p "$D"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          BASE="$PWD/build/rsx-simulator-14/phase54/rsx-spu-simulator.o"
+          printf 'source\tstatus\texit_code\tobject\n' > "$D/compile-summary.tsv"
+          SOURCES=(
+            toolkit/runtime/spu/spu_vm_pagemap.c
+            toolkit/runtime/syscalls/lv2_lock_line.c
+            toolkit/runtime/spu/spu_lifted_thread.c
+            toolkit/runtime/syscalls/spu_fallback.c
+            toolkit/runtime/spu/spu_raw.c
+            toolkit/libs/spurs/spurs_pm.c
+            toolkit/libs/spurs/spurs_taskset.c
+            toolkit/runtime/spu/spu_lockstep.c
+            toolkit/runtime/syscalls/sys_fs.c
+          )
+          OBJS=()
+          IDX=0
+          for REQUESTED in "${SOURCES[@]}"; do
+            IDX=$((IDX+1))
+            NAME="$(basename "$REQUESTED")"
+            SRC="$REQUESTED"
+            if [ ! -f "$SRC" ]; then
+              FOUND="$(find toolkit -type f -name "$NAME" -print -quit)"
+              if [ -n "$FOUND" ]; then SRC="$FOUND"; fi
+            fi
+            STEM="${IDX}-${NAME%.*}"
+            OBJ="$D/$STEM.o"
+            LOG="$D/$STEM.log"
+            if [ ! -f "$SRC" ]; then
+              printf '%s\tMISSING\tNA\t%s\n' "$REQUESTED" "$STEM.o" >> "$D/compile-summary.tsv"
+              continue
+            fi
+            if xcrun --sdk iphonesimulator clang \
+              -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+              -std=gnu11 -fblocks -c \
+              -I toolkit/include -I toolkit/include/ps3emu \
+              -I toolkit/libs/video -I toolkit/libs/input \
+              -I toolkit/runtime -I toolkit/runtime/spu -I toolkit/runtime/ppu \
+              "$SRC" -o "$OBJ" > "$LOG" 2>&1; then
+              CODE=0; STATUS=OK
+              OBJS+=("$OBJ")
+              xcrun nm -g "$OBJ" > "$D/$STEM.symbols.txt" 2>&1 || true
+            else
+              CODE=$?; STATUS=FAIL
+              echo "::warning::No compilo $SRC (exit=$CODE)"
+              tail -n 10 "$LOG" || true
+            fi
+            printf '%s\t%s\t%s\t%s\n' "$SRC" "$STATUS" "$CODE" "$STEM.o" >> "$D/compile-summary.tsv"
+          done
+          cat "$D/compile-summary.tsv"
+          if [ ! -s "$BASE" ]; then
+            echo 'MERGE56_EXIT_CODE=SKIPPED_NO_PHASE54_BASE' > "$D/result.txt"
+            exit 0
+          fi
+          if [ "${#OBJS[@]}" -ne "${#SOURCES[@]}" ]; then
+            echo 'MERGE56_EXIT_CODE=SKIPPED_NOT_ALL_MODULES_COMPILED' > "$D/result.txt"
+            echo "Compiled=${#OBJS[@]}/${#SOURCES[@]}" >> "$D/result.txt"
+            exit 0
+          fi
+          if xcrun --sdk iphonesimulator clang++ \
+            -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+            -r "$BASE" "${OBJS[@]}" -o "$D/runtime56-combined.o" \
+            > "$D/merge.log" 2>&1; then
+            echo 'MERGE56_EXIT_CODE=0' > "$D/result.txt"
+            xcrun nm -g "$D/runtime56-combined.o" > "$D/combined-symbols.txt" 2>&1 || true
+          else
+            CODE=$?
+            echo "MERGE56_EXIT_CODE=$CODE" > "$D/result.txt"
+            tail -n 35 "$D/merge.log" || true
+            exit 0
+          fi
+          if xcrun --sdk iphonesimulator clang++ \
+            -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+            -dynamiclib -Wl,-undefined,error \
+            "$D/runtime56-combined.o" \
+            -framework Foundation -framework UIKit -framework Metal \
+            -framework QuartzCore -framework CoreFoundation \
+            -lobjc -lc++ \
+            -o "$D/runtime56-test.dylib" > "$D/link.log" 2>&1; then
+            echo 'STRICT56_LINK_EXIT_CODE=0' >> "$D/result.txt"
+          else
+            CODE=$?
+            echo "STRICT56_LINK_EXIT_CODE=$CODE" >> "$D/result.txt"
+          fi
+          python3 - <<'PY56'
+          from pathlib import Path
+          import re
+          d=Path('build/rsx-simulator-14/phase56')
+          old=Path('build/rsx-simulator-14/phase54/undefined-in-link.txt')
+          before=set(old.read_text().splitlines()) if old.exists() else set()
+          log=(d/'link.log').read_text(errors='replace') if (d/'link.log').exists() else ''
+          names=set(re.findall(r'^\s*["\'`]?_([A-Za-z0-9_$]+)["\'`]?\s*,?\s+referenced from:',log,re.M))
+          for fname,items in [('undefined-in-link.txt',names),('resolved-from-phase54.txt',before-names),('new-since-phase54.txt',names-before)]:
+              (d/fname).write_text('\n'.join(sorted(items))+('\n' if items else ''))
+          summary=f'Phase54Undefined={len(before)}\nPhase56Undefined={len(names)}\nResolved={len(before-names)}\nNew={len(names-before)}\nTextual candidates require compilation verification. No PES gameplay.\n'
+          (d/'summary.txt').write_text(summary)
+          print(summary)
+          PY56
+          cat "$D/result.txt"
+
+      - name: Fase 58 - compilar servicios LV2 pendientes y comparar enlace
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$PWD/build/rsx-simulator-14/phase58"
+          mkdir -p "$D"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          BASE="$PWD/build/rsx-simulator-14/phase56/runtime56-combined.o"
+          printf 'source\tstatus\texit_code\tobject\n' > "$D/compile-summary.tsv"
+          SOURCES=(
+            toolkit/runtime/syscalls/sys_cond.c
+            toolkit/runtime/syscalls/sys_memory.c
+            toolkit/runtime/syscalls/sys_mutex.c
+            toolkit/runtime/syscalls/sys_rwlock.c
+            toolkit/runtime/syscalls/sys_semaphore.c
+            toolkit/runtime/syscalls/sys_timer.c
+            toolkit/runtime/syscalls/sys_vm.c
+          )
+          OBJS=()
+          IDX=0
+          for REQUESTED in "${SOURCES[@]}"; do
+            IDX=$((IDX+1))
+            NAME="$(basename "$REQUESTED")"
+            SRC="$REQUESTED"
+            if [ ! -f "$SRC" ]; then
+              FOUND="$(find toolkit -type f -name "$NAME" -print -quit)"
+              if [ -n "$FOUND" ]; then SRC="$FOUND"; fi
+            fi
+            STEM="${IDX}-${NAME%.*}"
+            OBJ="$D/$STEM.o"
+            LOG="$D/$STEM.log"
+            if [ ! -f "$SRC" ]; then
+              printf '%s\tMISSING\tNA\t%s\n' "$REQUESTED" "$STEM.o" >> "$D/compile-summary.tsv"
+              echo "::warning::Source unavailable: $REQUESTED"
+              continue
+            fi
+            if xcrun --sdk iphonesimulator clang \
+              -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+              -std=gnu11 -fblocks -c \
+              -I toolkit/include -I toolkit/include/ps3emu \
+              -I toolkit/libs/video -I toolkit/libs/input \
+              -I toolkit/runtime -I toolkit/runtime/spu -I toolkit/runtime/ppu \
+              "$SRC" -o "$OBJ" > "$LOG" 2>&1; then
+              CODE=0; STATUS=OK
+              OBJS+=("$OBJ")
+              xcrun nm -g "$OBJ" > "$D/$STEM.symbols.txt" 2>&1 || true
+            else
+              CODE=$?; STATUS=FAIL
+              echo "::warning::No compilo $SRC (exit=$CODE)"
+              tail -n 15 "$LOG" || true
+            fi
+            printf '%s\t%s\t%s\t%s\n' "$SRC" "$STATUS" "$CODE" "$STEM.o" >> "$D/compile-summary.tsv"
+          done
+          cat "$D/compile-summary.tsv"
+          if [ ! -s "$BASE" ]; then
+            echo 'MERGE58_EXIT_CODE=SKIPPED_NO_PHASE56_BASE' > "$D/result.txt"
+            exit 0
+          fi
+          if [ "${#OBJS[@]}" -ne "${#SOURCES[@]}" ]; then
+            echo 'MERGE58_EXIT_CODE=SKIPPED_NOT_ALL_MODULES_COMPILED' > "$D/result.txt"
+            echo "Compiled=${#OBJS[@]}/${#SOURCES[@]}" >> "$D/result.txt"
+            exit 0
+          fi
+          if xcrun --sdk iphonesimulator clang++ \
+            -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+            -r "$BASE" "${OBJS[@]}" -o "$D/runtime58-combined.o" \
+            > "$D/merge.log" 2>&1; then
+            echo 'MERGE58_EXIT_CODE=0' > "$D/result.txt"
+            xcrun nm -g "$D/runtime58-combined.o" > "$D/combined-symbols.txt" 2>&1 || true
+          else
+            CODE=$?
+            echo "MERGE58_EXIT_CODE=$CODE" > "$D/result.txt"
+            tail -n 35 "$D/merge.log" || true
+            exit 0
+          fi
+          if xcrun --sdk iphonesimulator clang++ \
+            -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+            -dynamiclib -Wl,-undefined,error \
+            "$D/runtime58-combined.o" \
+            -framework Foundation -framework UIKit -framework Metal \
+            -framework QuartzCore -framework CoreFoundation \
+            -lobjc -lc++ \
+            -o "$D/runtime58-test.dylib" > "$D/link.log" 2>&1; then
+            echo 'STRICT58_LINK_EXIT_CODE=0' >> "$D/result.txt"
+          else
+            CODE=$?
+            echo "STRICT58_LINK_EXIT_CODE=$CODE" >> "$D/result.txt"
+          fi
+          python3 - <<'PY58'
+          from pathlib import Path
+          import re
+          d=Path('build/rsx-simulator-14/phase58')
+          old=Path('build/rsx-simulator-14/phase56/undefined-in-link.txt')
+          before=set(old.read_text().splitlines()) if old.exists() else set()
+          log=(d/'link.log').read_text(errors='replace') if (d/'link.log').exists() else ''
+          names=set(re.findall(r'^\s*["\'`]?_([A-Za-z0-9_$]+)["\'`]?\s*,?\s+referenced from:',log,re.M))
+          for fname,items in [('undefined-in-link.txt',names),('resolved-from-phase56.txt',before-names),('new-since-phase56.txt',names-before)]:
+              (d/fname).write_text('\n'.join(sorted(items))+('\n' if items else ''))
+          summary=(f'Phase56Undefined={len(before)}\nPhase58Undefined={len(names)}\n'
+                   f'Resolved={len(before-names)}\nNew={len(names-before)}\n'
+                   'Strict linking diagnostic only. No PS3 code or gameplay executed.\n')
+          (d/'summary.txt').write_text(summary)
+          print(summary)
+          PY58
+          cat "$D/result.txt"
+
+      - name: Fase 60 - adaptar Mach VM en copia temporal y compilar Win32
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$PWD/build/rsx-simulator-14/phase60"
+          mkdir -p "$D"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          BASE="$PWD/build/rsx-simulator-14/phase58/runtime58-combined.o"
+          CANDIDATE="$(find toolkit -type f -name win32_compat.c -print -quit)"
+          if [ -z "$CANDIDATE" ]; then
+            echo 'WIN32_SOURCE_FOUND=NO' | tee "$D/result.txt"
+          else
+            echo "WIN32_SOURCE_FOUND=YES" | tee "$D/result.txt"
+            echo "$CANDIDATE" > "$D/source-path.txt"
+            cp "$CANDIDATE" "$D/win32_compat-source.c"
+            # Aplicar SOLO en la copia temporal del checkout de GitHub Actions.
+            # iPhoneOS no permite mach/mach_vm.h; vm_region_64 esta declarado en vm_map.h.
+            if python3 - "$CANDIDATE" <<'PY60PATCH'
+          from pathlib import Path
+          import sys
+          p=Path(sys.argv[1])
+          s=p.read_text()
+          changes=[
+              ('#  include <mach/mach_vm.h>', '#  include <mach/vm_map.h>'),
+              ('mach_vm_address_t a = (mach_vm_address_t)addr;', 'vm_address_t a = (vm_address_t)addr;'),
+              ('mach_vm_size_t    sz = 0;', 'vm_size_t    sz = 0;'),
+              ('mach_vm_region(mach_task_self(),', 'vm_region_64(mach_task_self(),'),
+          ]
+          for old,new in changes:
+              if s.count(old)!=1: raise RuntimeError(f'Patron no unico/no encontrado: {old!r} ({s.count(old)})')
+              s=s.replace(old,new,1)
+          p.write_text(s)
+          print('MACH_VM_PATCH_APPLIED=YES')
+          PY60PATCH
+            then
+              echo 'MACH_VM_PATCH_EXIT_CODE=0' | tee -a "$D/result.txt"
+            else
+              PATCH_CODE=$?
+              echo "MACH_VM_PATCH_EXIT_CODE=$PATCH_CODE" | tee -a "$D/result.txt"
+            fi
+            if xcrun --sdk iphonesimulator clang \
+              -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+              -std=gnu11 -fblocks -c \
+              -I toolkit/include -I toolkit/include/ps3emu \
+              -I toolkit/libs/video -I toolkit/libs/input \
+              -I toolkit/runtime -I toolkit/runtime/spu -I toolkit/runtime/ppu \
+              "$CANDIDATE" -o "$D/win32_compat.o" > "$D/compile.log" 2>&1; then
+              CODE=0
+            else
+              CODE=$?
+            fi
+            echo "WIN32_COMPILE_EXIT_CODE=$CODE" | tee -a "$D/result.txt"
+            if [ "$CODE" -eq 0 ]; then
+              xcrun nm -g "$D/win32_compat.o" > "$D/win32_compat-symbols.txt" 2>&1 || true
+              xcrun nm -g -U "$D/win32_compat.o" > "$D/win32_compat-definitions.txt" 2>&1 || true
+              if [ -s "$BASE" ]; then
+                if xcrun --sdk iphonesimulator clang++ \
+                  -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+                  -r "$BASE" "$D/win32_compat.o" -o "$D/runtime60-preview.o" \
+                  > "$D/preview-merge.log" 2>&1; then
+                  MERGE_CODE=0
+                else
+                  MERGE_CODE=$?
+                fi
+                echo "WIN32_PREVIEW_MERGE_EXIT_CODE=$MERGE_CODE" | tee -a "$D/result.txt"
+              fi
+            fi
+          fi
+          python3 - <<'PY60'
+          from pathlib import Path
+          import re
+          d=Path('build/rsx-simulator-14/phase60')
+          old=Path('build/rsx-simulator-14/phase58/undefined-in-link.txt')
+          missing=[x.strip() for x in old.read_text().splitlines() if x.strip()] if old.exists() else []
+          src=(d/'win32_compat-source.c').read_text(errors='replace') if (d/'win32_compat-source.c').exists() else ''
+          sym=(d/'win32_compat-definitions.txt').read_text(errors='replace') if (d/'win32_compat-definitions.txt').exists() else ''
+          definitions=set(re.findall(r'^\S+\s+[A-Z]\s+_([A-Za-z0-9_]+)\s*$',sym,re.M))
+          win32={'CloseHandle','CreateEventA','CreateThread','SetEvent','SetLastError','VirtualAlloc','VirtualQuery','WaitForSingleObject'}
+          lines=['symbol\tcategory\tdefined_by_win32_object\tmentioned_in_win32_source']
+          for name in missing:
+              lines.append(f'{name}\t{"Win32" if name in win32 else "runtime"}\t{"YES" if name in definitions else "NO"}\t{"YES" if re.search(r"\b"+re.escape(name)+r"\b",src) else "NO"}')
+          (d/'coverage.tsv').write_text('\n'.join(lines)+'\n')
+          (d/'summary.txt').write_text(
+            'Phase58Undefined='+str(len(missing))+'\n'+
+            'Win32Missing='+str(len(set(missing)&win32))+'\n'+
+            'Win32DefinitionsMatching='+str(len(set(missing)&definitions&win32))+'\n'+
+            'RuntimeMissing='+str(len(set(missing)-win32))+'\n'+
+            'IMPORTANT: compile and partial merge do not prove behavioral equivalence.\n'+
+            'No dynamic loading, UIKit initialization, game code, or gameplay executed.\n')
+          print((d/'summary.txt').read_text())
+          PY60
+          echo 'NO SE ACTIVA NI EJECUTA LA CAPA WIN32 EN ESTA PRUEBA' > "$D/scope.txt"
+
+      - name: Fase 61 - enlazar runtime con Win32 y medir dependencias reales
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$PWD/build/rsx-simulator-14/phase61"
+          mkdir -p "$D"
+          SRC="$PWD/build/rsx-simulator-14/phase60/runtime60-preview.o"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          if [ ! -s "$SRC" ]; then
+            echo "STRICT61_LINK_EXIT_CODE=SKIPPED_MISSING_OBJECT" | tee "$D/result.txt"
+            exit 0
+          fi
+          if xcrun --sdk iphonesimulator clang++ \
+            -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+            -dynamiclib -Wl,-undefined,error \
+            "$SRC" -framework Foundation -framework UIKit -framework Metal \
+            -framework QuartzCore -framework MetalKit -lc++ \
+            -o "$D/runtime61-test.dylib" > "$D/link.log" 2>&1; then
+            CODE=0
+          else
+            CODE=$?
+          fi
+          echo "STRICT61_LINK_EXIT_CODE=$CODE" | tee "$D/result.txt"
+          python3 - <<'PY61'
+          from pathlib import Path
+          import re
+          root=Path('build/rsx-simulator-14')
+          d=root/'phase61'
+          previous={s.strip() for s in (root/'phase58/undefined-in-link.txt').read_text().splitlines() if s.strip()}
+          log=(d/'link.log').read_text(errors='replace') if (d/'link.log').exists() else ''
+          missing=set(re.findall(r'^\s*"_([^"\n]+)", referenced from:', log, re.M))
+          for filename,items in (
+              ('undefined-in-link.txt',missing),
+              ('resolved-from-phase58.txt',previous-missing),
+              ('new-since-phase58.txt',missing-previous)):
+              (d/filename).write_text('\n'.join(sorted(items))+('\n' if items else ''))
+          status=(d/'result.txt').read_text().strip()
+          summary=(f'{status}\n'
+                   f'Phase58Undefined={len(previous)}\n'
+                   f'Phase61Undefined={len(missing)}\n'
+                   f'ResolvedFrom58={len(previous-missing)}\n'
+                   f'NewSince58={len(missing-previous)}\n'
+                   'Scope=Link only; no runtime initialization or execution\n')
+          (d/'summary.txt').write_text(summary)
+          print(summary)
+          PY61
+
+      - name: Publicar diagnostico
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pes2013-ios-win32-phase61
+          path: build/rsx-simulator-14/
+          if-no-files-found: warn
+          retention-days: 7
