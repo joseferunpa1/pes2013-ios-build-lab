@@ -1,0 +1,86 @@
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -92,6 +92,9 @@
+ static id<MTLDevice>       s_dev;
+ static id<MTLCommandQueue> s_queue;
+ static CAMetalLayer*       s_layer;      /* windowed only   */
++#if TARGET_OS_IPHONE
++static CAMetalLayer*       s_ios_host_layer; /* supplied by UIKit before init */
++#endif
+ static id<MTLTexture>      s_offscreen;  /* headless only   */
+ static id<MTLTexture>      s_depth;      /* depth + stencil, both surfaces  */
+ #if !TARGET_OS_IPHONE
+@@ -5102,6 +5105,20 @@
+ 
+ /* ---- public API ---------------------------------------------------------- */
+ 
++#if TARGET_OS_IPHONE
++/* UIKit owns the host view. Call on the main thread, before backend init.
++ * The pointer must be a CAMetalLayer (not a UIView or CAMetalDrawable).
++ * Pass NULL to keep the original offscreen/headless operation. */
++void rsx_metal_backend_set_ios_layer(void* layer)
++{
++    if (s_ready) {
++        fprintf(stderr, "[RSX metal] iOS layer must be set before init\n");
++        return;
++    }
++    s_ios_host_layer = (__bridge CAMetalLayer*)layer;
++}
++#endif
++
+ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
+ {
+     @autoreleasepool {
+@@ -5128,8 +5145,20 @@
+ 
+         int rc;
+ #if TARGET_OS_IPHONE
+-        s_headless = 1;
+-        rc = create_offscreen();
++        if (s_ios_host_layer && !s_headless) {
++            /* The owning UIView creates and sizes its CAMetalLayer on main.
++             * Only the Metal runtime is initialized here; UIKit isn't pumped. */
++            s_layer = s_ios_host_layer;
++            s_layer.device = s_dev;
++            s_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
++            s_layer.framebufferOnly = YES;
++            if (s_layer.drawableSize.width <= 0 || s_layer.drawableSize.height <= 0)
++                s_layer.drawableSize = CGSizeMake((CGFloat)s_width, (CGFloat)s_height);
++            rc = 0;
++        } else {
++            s_headless = 1;
++            rc = create_offscreen();
++        }
+ #else
+         rc = s_headless ? create_offscreen() : create_window(title);
+ #endif
+@@ -5260,6 +5289,9 @@
+         s_default_sampler = nil;
+         s_ds_default = nil;
+         s_layer     = nil;
++#if TARGET_OS_IPHONE
++        s_ios_host_layer = nil;
++#endif
+         s_offscreen = nil;
+         s_depth     = nil;
+         s_queue     = nil;
+--- a/libs/video/rsx_metal_backend.h
++++ b/libs/video/rsx_metal_backend.h
+@@ -19,6 +19,17 @@
+ 
+ #ifdef __cplusplus
+ extern "C" {
++#endif
++
++/* iOS only: supply a CAMetalLayer* owned by the app's UIKit view before init.
++ * The layer must remain alive while rendering; call on the main thread.
++ * Pass NULL to select the existing headless/offscreen mode.
++ * This is a no-op declaration on other platforms (no implementation there). */
++#if defined(__APPLE__)
++#  include <TargetConditionals.h>
++#  if TARGET_OS_IPHONE
++void rsx_metal_backend_set_ios_layer(void* layer);
++#  endif
+ #endif
+ 
+ /* Create the device, surface and command queue, and register the backend with

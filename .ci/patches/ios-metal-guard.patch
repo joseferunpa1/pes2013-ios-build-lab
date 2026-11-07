@@ -1,0 +1,20 @@
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -46,6 +46,7 @@
+  * no route to a custom vertex program, depth/stencil, MRT or render-to-texture,
+  * so it cannot grow into the real pipeline.
+  */
++#include <TargetConditionals.h>
+ #import <Metal/Metal.h>
+ #import <QuartzCore/CAMetalLayer.h>
+ #import <QuartzCore/QuartzCore.h>
+@@ -93,7 +94,9 @@
+ static CAMetalLayer*       s_layer;      /* windowed only   */
+ static id<MTLTexture>      s_offscreen;  /* headless only   */
+ static id<MTLTexture>      s_depth;      /* depth + stencil, both surfaces  */
++#if !TARGET_OS_IPHONE
+ static NSWindow*           s_window;
++#endif
+ static int                 s_headless;
+ static atomic_int          s_closed;
+ #if !TARGET_OS_IPHONE
