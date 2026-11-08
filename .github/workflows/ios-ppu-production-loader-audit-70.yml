@@ -1,0 +1,103 @@
+name: Fase 70 - auditar y compilar despachador PPU de produccion iOS
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  production-loader-simulator:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Descargar laboratorio publico
+        uses: actions/checkout@v4
+
+      - name: Preparar toolkit anclado y parche anterior
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$PWD/build/phase70"
+          mkdir -p "$D"
+          xcodebuild -version > "$D/xcode.txt"
+          xcrun --sdk iphonesimulator --show-sdk-version >> "$D/xcode.txt"
+          echo "RUNNER_ARCH=$(uname -m)" | tee "$D/environment.txt"
+          test -f .ci/phase69/generate_guest.py || { echo 'ERROR: falta .ci/phase69/generate_guest.py'; exit 1; }
+          git clone --quiet https://github.com/erikomis/ps3recomp.git toolkit
+          git -C toolkit checkout --quiet 675ed394
+          git clone --quiet --depth 1 https://github.com/erikomis/pes2013-recomp.git pes2013-upstream
+          git -C toolkit apply ../pes2013-upstream/patches/ps3recomp-675ed39-pes13.patch
+          test -f toolkit/runtime/ppu/ppu_loader.cpp
+          shasum -a 256 toolkit/runtime/ppu/ppu_loader.cpp > "$D/ppu-loader-sha256.txt"
+          echo 'TOOLKIT_PREPARED=YES' | tee "$D/prep-result.txt"
+
+      - name: Generar cabecera real del lifter para la ABI PPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$PWD/build/phase70"
+          python3 .ci/phase69/generate_guest.py > "$D/guest-generation.txt"
+          mkdir -p "$D/Generated"
+          python3 toolkit/tools/ppu_lifter.py .ci/phase69/tiny.ppc.bin \
+            --raw --base 0x10000 --functions .ci/phase69/functions.json \
+            --jobs 1 --single-file --output "$D/Generated" \
+            > "$D/lift.log" 2>&1
+          test -s "$D/Generated/ppu_recomp.h"
+          test -s "$D/Generated/ppu_recomp.c"
+          echo 'GENERATED_PPU_ABI_HEADER=YES' | tee "$D/abi-result.txt"
+          # Preserve original source and list declared production entrypoints.
+          grep -nE 'ps3_indirect_call|ppu_recomp_register|ppu_run\(|ppu_load_elf\(' \
+            toolkit/runtime/ppu/ppu_loader.cpp > "$D/loader-entrypoints.txt" || true
+          grep -nE 'ps3_indirect_call|ppu_recomp_register|function_table' \
+            "$D/Generated/ppu_recomp.h" > "$D/generated-abi-excerpt.txt" || true
+
+      - name: Compilar ppu_loader de produccion para ambos simuladores
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$PWD/build/phase70"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          : > "$D/compile-result.txt"
+          FAILED=0
+          for ARCH in arm64 x86_64; do
+            echo "COMPILING_ARCH=$ARCH" | tee -a "$D/compile-result.txt"
+            xcrun --sdk iphonesimulator clang++ \
+              -target "${ARCH}-apple-ios16.0-simulator" -isysroot "$SDK" \
+              -std=c++17 -fblocks -ffunction-sections -fdata-sections \
+              -I "$D/Generated" -I toolkit/include -I toolkit/include/ps3emu \
+              -I toolkit/runtime -I toolkit/runtime/ppu \
+              -I toolkit/runtime/memory -I toolkit/runtime/platform \
+              -I toolkit/libs/system -I toolkit/libs/video -I toolkit/libs/input \
+              -c toolkit/runtime/ppu/ppu_loader.cpp \
+              -o "$D/ppu_loader-${ARCH}.o" > "$D/compile-${ARCH}.log" 2>&1
+            CODE=$?
+            echo "PRODUCTION_LOADER_COMPILE_${ARCH}=$CODE" | tee -a "$D/compile-result.txt"
+            if [ "$CODE" -eq 0 ]; then
+              xcrun nm -g "$D/ppu_loader-${ARCH}.o" > "$D/loader-symbols-${ARCH}.txt" 2>&1 || true
+              xcrun nm -g -U "$D/ppu_loader-${ARCH}.o" > "$D/loader-definitions-${ARCH}.txt" 2>&1 || true
+              if grep -Eq '[[:space:]]_ps3_indirect_call$' "$D/loader-definitions-${ARCH}.txt"; then
+                echo "PRODUCTION_DISPATCH_SYMBOL_${ARCH}=YES" | tee -a "$D/compile-result.txt"
+              else
+                echo "PRODUCTION_DISPATCH_SYMBOL_${ARCH}=NOT_DETECTED" | tee -a "$D/compile-result.txt"
+              fi
+            else
+              FAILED=1
+              echo "FIRST_ERRORS_${ARCH}:" | tee -a "$D/compile-result.txt"
+              grep -n -m 20 -E 'fatal error:|error:|undeclared|not found' "$D/compile-${ARCH}.log" \
+                | tee -a "$D/compile-result.txt" || true
+            fi
+          done
+          printf 'PRODUCTION_LOADER_TEST_EXECUTED=NO\nTEST_ONLY_DISPATCH_COMPILED=NO\n' \
+            | tee "$D/scope.txt"
+          if [ "$FAILED" -ne 0 ]; then
+            echo 'PHASE70_COMPILATION_INCOMPLETE: review compile-arm64.log and compile-x86_64.log' | tee -a "$D/compile-result.txt"
+            exit 1
+          fi
+          echo 'PHASE70_PRODUCTION_LOADER_COMPILED' | tee -a "$D/compile-result.txt"
+
+      - name: Publicar diagnosticos aun cuando la compilacion falle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pes2013-ios-production-loader-phase70
+          path: build/phase70/
+          if-no-files-found: warn
+          retention-days: 7
