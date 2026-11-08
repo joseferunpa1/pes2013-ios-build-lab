@@ -1,0 +1,124 @@
+name: Fase 71 - enlazar funciones PPU con despachador de produccion
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  loader-guest-link:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Obtener archivos del laboratorio
+        uses: actions/checkout@v4
+
+      - name: Preparar toolkit anclado y funciones PowerPC sinteticas
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$GITHUB_WORKSPACE/build/phase71"
+          mkdir -p "$D/Generated"
+          printf 'RUNNER_ARCH=%s\n' "$(uname -m)" > "$D/environment.txt"
+          xcodebuild -version > "$D/xcode.txt"
+          xcrun --sdk iphonesimulator --show-sdk-version >> "$D/xcode.txt"
+          test -f .ci/phase69/generate_guest.py
+          test -f .ci/phase69/functions.json || { echo 'Falta functions.json de la fase 69' >&2; exit 1; }
+          git clone --quiet https://github.com/erikomis/ps3recomp.git toolkit
+          git -C toolkit checkout --quiet 675ed394
+          git clone --quiet --depth 1 https://github.com/erikomis/pes2013-recomp.git pes2013-upstream
+          git -C toolkit apply ../pes2013-upstream/patches/ps3recomp-675ed39-pes13.patch
+          test -f toolkit/runtime/ppu/ppu_loader.cpp
+          python3 .ci/phase69/generate_guest.py > "$D/guest-generation.txt"
+          python3 toolkit/tools/ppu_lifter.py .ci/phase69/tiny.ppc.bin \
+            --raw --base 0x10000 --functions .ci/phase69/functions.json \
+            --jobs 1 --single-file --output "$D/Generated" > "$D/lift.log" 2>&1
+          test -s "$D/Generated/ppu_recomp.c"
+          test -s "$D/Generated/ppu_recomp.h"
+          grep -Fq 'ps3_indirect_call(ctx);' "$D/Generated/ppu_recomp.c"
+          echo 'SOURCE_PREPARED=YES' > "$D/prepare-result.txt"
+
+      - name: Compilar objetos del loader original y las funciones recompiladas
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$GITHUB_WORKSPACE/build/phase71"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          FAILED=0
+          : > "$D/compile-result.txt"
+          for ARCH in arm64 x86_64; do
+            COMMON=(-target "${ARCH}-apple-ios16.0-simulator" -isysroot "$SDK" \
+              -std=c++17 -fblocks -ffunction-sections -fdata-sections \
+              -I "$D/Generated" -I toolkit/include -I toolkit/include/ps3emu \
+              -I toolkit/runtime -I toolkit/runtime/ppu -I toolkit/runtime/memory \
+              -I toolkit/runtime/platform -I toolkit/libs/system \
+              -I toolkit/libs/video -I toolkit/libs/input)
+            xcrun --sdk iphonesimulator clang++ "${COMMON[@]}" \
+              -c toolkit/runtime/ppu/ppu_loader.cpp -o "$D/loader-${ARCH}.o" \
+              > "$D/loader-compile-${ARCH}.log" 2>&1
+            L=$?
+            printf 'LOADER_COMPILE_%s=%s\n' "$ARCH" "$L" | tee -a "$D/compile-result.txt"
+            xcrun --sdk iphonesimulator clang++ "${COMMON[@]}" \
+              -x c++ -c "$D/Generated/ppu_recomp.c" \
+              -o "$D/guest-${ARCH}.o" > "$D/guest-compile-${ARCH}.log" 2>&1
+            G=$?
+            printf 'GUEST_COMPILE_%s=%s\n' "$ARCH" "$G" | tee -a "$D/compile-result.txt"
+            if [ "$L" -ne 0 ] || [ "$G" -ne 0 ]; then
+              FAILED=1
+              echo "FAILED_ARCH=$ARCH" | tee -a "$D/compile-result.txt"
+              grep -n -m 20 -E 'error:|fatal error:' "$D/loader-compile-${ARCH}.log" "$D/guest-compile-${ARCH}.log" \
+                | tee -a "$D/compile-result.txt" || true
+            fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            echo 'PHASE71_COMPILE_INCOMPLETE' | tee -a "$D/compile-result.txt"
+            exit 1
+          fi
+          echo 'PHASE71_COMPILE_PASS' | tee -a "$D/compile-result.txt"
+
+      - name: Enlazar ambos objetos y auditar simbolos del despachador
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$GITHUB_WORKSPACE/build/phase71"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          FAILED=0
+          : > "$D/merge-result.txt"
+          for ARCH in arm64 x86_64; do
+            xcrun nm -g "$D/loader-${ARCH}.o" > "$D/loader-symbols-${ARCH}.txt" 2>&1 || true
+            xcrun nm -g "$D/guest-${ARCH}.o" > "$D/guest-symbols-${ARCH}.txt" 2>&1 || true
+            xcrun --sdk iphonesimulator clang++ \
+              -target "${ARCH}-apple-ios16.0-simulator" -isysroot "$SDK" \
+              -r "$D/loader-${ARCH}.o" "$D/guest-${ARCH}.o" \
+              -o "$D/loader-guest-${ARCH}.o" > "$D/merge-${ARCH}.log" 2>&1
+            CODE=$?
+            printf 'PRODUCTION_GUEST_MERGE_%s=%s\n' "$ARCH" "$CODE" | tee -a "$D/merge-result.txt"
+            if [ "$CODE" -eq 0 ]; then
+              xcrun nm -g "$D/loader-guest-${ARCH}.o" > "$D/combined-symbols-${ARCH}.txt" 2>&1 || true
+              xcrun nm -g -u "$D/loader-guest-${ARCH}.o" > "$D/combined-undefined-${ARCH}.txt" 2>&1 || true
+              file "$D/loader-guest-${ARCH}.o" > "$D/file-${ARCH}.txt" || true
+            else
+              FAILED=1
+              grep -n -m 25 -E 'error:|duplicate symbol|Undefined symbols|ld:' "$D/merge-${ARCH}.log" \
+                | tee -a "$D/merge-result.txt" || true
+            fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            echo 'PHASE71_MERGE_INCOMPLETE' | tee -a "$D/merge-result.txt"
+            exit 1
+          fi
+          python3 .ci/phase71/audit_symbols.py "$D"
+          CODE=$?
+          echo "PHASE71_SYMBOL_AUDIT_EXIT_CODE=$CODE" | tee -a "$D/merge-result.txt"
+          if [ "$CODE" -ne 0 ]; then exit "$CODE"; fi
+          echo 'PHASE71_STATIC_INTEGRATION_PASS' | tee -a "$D/merge-result.txt"
+          printf '%s\n' 'Not executed: production dispatcher, HLE, RSX, game.' \
+            'No final dynamic executable or dylib link.' \
+            'Combined Mach-O object can still have undefined runtime dependencies.' > "$D/scope.txt"
+
+      - name: Guardar resultados aunque haya fallos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pes2013-ios-production-dispatch-phase71
+          path: build/phase71/
+          if-no-files-found: warn
+          retention-days: 7
