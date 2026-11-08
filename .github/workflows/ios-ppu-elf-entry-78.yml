@@ -371,6 +371,23 @@ jobs:
             -I toolkit/runtime/platform -I toolkit/libs/system \
             -c toolkit/runtime/syscalls/sys_memory.c -o "$D/sys_memory.o" \
             > "$D/sys_memory-compile.log" 2>&1
+          # Production provider for g_ppu_thread_entry_trampoline and
+          # ppu_thread_register_main (both used by ppu_run).
+          # Preserve the toolkit source; do not use stub implementations.
+          xcrun --sdk iphonesimulator clang -target "$TARGET" -isysroot "$SDK" \
+            -std=gnu11 -fblocks -ffunction-sections -fdata-sections \
+            -I toolkit/include -I toolkit/include/ps3emu \
+            -I toolkit/runtime -I toolkit/runtime/ppu \
+            -I toolkit/runtime/syscalls -I toolkit/runtime/memory \
+            -I toolkit/runtime/platform -I toolkit/runtime/spu \
+            -I toolkit/libs/system -I toolkit/libs/video -I toolkit/libs/input \
+            -c toolkit/runtime/syscalls/sys_ppu_thread.c -o "$D/sys_ppu_thread.o" \
+            > "$D/sys_ppu_thread-compile.log" 2>&1
+          xcrun nm -g "$D/sys_ppu_thread.o" > "$D/sys_ppu_thread-symbols.txt" 2>&1
+          grep -Eq ' _g_ppu_thread_entry_trampoline$' "$D/sys_ppu_thread-symbols.txt"
+          grep -Eq ' _ppu_thread_register_main$' "$D/sys_ppu_thread-symbols.txt"
+          printf 'PPU_THREAD_PROVIDER_COMPILE=PASS\nPPU_THREAD_REQUIRED_SYMBOLS=FOUND\n' \
+            > "$D/sys_ppu_thread-result.txt"
           # Compile native diagnostics, keeping UIKit's main() as the sole entry.
           xcrun --sdk iphonesimulator clang++ -target "$TARGET" -isysroot "$SDK" \
             -std=c++17 -fblocks -ffunction-sections -fdata-sections \
@@ -383,7 +400,7 @@ jobs:
             -std=c++17 -fobjc-arc -fblocks -fobjc-exceptions -x objective-c++ \
             -c .ci/phase78/ProductionApp78.mm -o "$D/app-main.o" \
             > "$D/app-main-compile.log" 2>&1
-          OBJECTS=("$D/app-main.o" "$D/probe-entry.o" "$D/sys_memory.o" \
+          OBJECTS=("$D/app-main.o" "$D/probe-entry.o" "$D/sys_memory.o" "$D/sys_ppu_thread.o" \
             "$BASE/loader-${ARCH}.o" "$BASE/guest-${ARCH}.o" "$BASE/vm-${ARCH}.o")
           for NAME in win32_compat cellGcmSys spu_coherency spu_raw; do
             OBJECTS+=("$PREV/${NAME}-${ARCH}.o")
