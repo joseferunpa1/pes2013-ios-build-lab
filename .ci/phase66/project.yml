@@ -21,7 +21,7 @@ targets:
         CLANG_ENABLE_OBJC_ARC: YES
         GENERATE_INFOPLIST_FILE: YES
         DEAD_CODE_STRIPPING: YES
-        HEADER_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../../toolkit $(SRCROOT)/LiftProbe/Generated"
+        HEADER_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../../toolkit $(SRCROOT)/../../toolkit/runtime/ppu $(SRCROOT)/LiftProbe/Generated"
         LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../../build/phase66"
         OTHER_LDFLAGS: "$(inherited) -lsysprx66 -Wl,-dead_strip"
     dependencies:

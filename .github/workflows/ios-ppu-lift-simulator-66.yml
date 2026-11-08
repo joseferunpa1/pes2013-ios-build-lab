@@ -45,6 +45,27 @@ jobs:
           fi
           echo 'LIFTER_OUTPUT_GENERATED=YES' | tee "$D/lift-result.txt"
           sed -n '/func_00010000(/,+22p' "$D/lifted-ppu.c" | head -n 24 > "$D/lifted-function-excerpt.txt"
+          # Upstream emits C++ declarations (extern "C") even though its filename is .c.
+          # Keep the unmodified generated C in the diagnostics and compile a .cpp copy.
+          test -s toolkit/runtime/ppu/ppu_vmx.h
+          mv .ci/phase66/LiftProbe/Generated/ppu_recomp.c .ci/phase66/LiftProbe/Generated/ppu_recomp.cpp
+          echo 'GENERATED_CPP_UNIT=YES' | tee -a "$D/lift-result.txt"
+          # Independent syntax check before invoking XcodeGen/Xcode.
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          set +e
+          xcrun --sdk iphonesimulator clang++ \
+            -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+            -std=c++17 -fsyntax-only \
+            -I .ci/phase66/LiftProbe/Generated -I toolkit/runtime/ppu \
+            .ci/phase66/LiftProbe/Generated/ppu_recomp.cpp \
+            > "$D/generated-cpp-syntax.log" 2>&1
+          SYNTAX_CODE=$?
+          set -e
+          echo "GENERATED_CPP_SYNTAX_EXIT_CODE=$SYNTAX_CODE" | tee -a "$D/lift-result.txt"
+          if [ "$SYNTAX_CODE" -ne 0 ]; then
+            tail -n 65 "$D/generated-cpp-syntax.log" || true
+            exit "$SYNTAX_CODE"
+          fi
 
       - name: Compilar HLE de produccion en ambas arquitecturas de simulador
         shell: bash
