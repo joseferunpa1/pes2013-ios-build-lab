@@ -384,7 +384,7 @@ jobs:
           EXE="$D/ProductionDispatch75.app/ProductionDispatch75"
           xcrun --sdk iphonesimulator clang++ -target "$TARGET" -isysroot "$SDK" \
             -Wl,-dead_strip -Wl,-undefined,error \
-            "${OBJECTS[@]}" -framework Foundation -framework UIKit \
+            "${OBJECTS[@]}" -framework Foundation -framework UIKit -framework CoreGraphics \
             -o "$EXE" > "$D/app-link.log" 2>&1
           python3 - "$D/ProductionDispatch75.app/Info.plist" <<'PY75PLIST'
           import plistlib,sys
