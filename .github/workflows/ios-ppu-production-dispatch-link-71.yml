@@ -20,21 +20,28 @@ jobs:
           printf 'RUNNER_ARCH=%s\n' "$(uname -m)" > "$D/environment.txt"
           xcodebuild -version > "$D/xcode.txt"
           xcrun --sdk iphonesimulator --show-sdk-version >> "$D/xcode.txt"
-          test -f .ci/phase69/generate_guest.py
-          test -f .ci/phase69/functions.json || { echo 'Falta functions.json de la fase 69' >&2; exit 1; }
+          # functions.json y tiny.ppc.bin se generan, NO se almacenan en Git.
+          if [ ! -f .ci/phase69/generate_guest.py ]; then
+            echo 'PHASE71_MISSING_GENERATOR=.ci/phase69/generate_guest.py' | tee "$D/prepare-result.txt"
+            exit 1
+          fi
+          python3 .ci/phase69/generate_guest.py > "$D/guest-generation.txt" 2> "$D/guest-generation-error.log"
+          test -s .ci/phase69/functions.json || { echo 'PHASE71_FUNCTIONS_JSON_MISSING_AFTER_GENERATION' | tee "$D/prepare-result.txt"; exit 1; }
+          test -s .ci/phase69/tiny.ppc.bin || { echo 'PHASE71_PPC_BINARY_MISSING_AFTER_GENERATION' | tee "$D/prepare-result.txt"; exit 1; }
+          echo 'PHASE71_GUEST_INPUT_GENERATED=YES' | tee "$D/prepare-result.txt"
           git clone --quiet https://github.com/erikomis/ps3recomp.git toolkit
           git -C toolkit checkout --quiet 675ed394
           git clone --quiet --depth 1 https://github.com/erikomis/pes2013-recomp.git pes2013-upstream
           git -C toolkit apply ../pes2013-upstream/patches/ps3recomp-675ed39-pes13.patch
           test -f toolkit/runtime/ppu/ppu_loader.cpp
-          python3 .ci/phase69/generate_guest.py > "$D/guest-generation.txt"
           python3 toolkit/tools/ppu_lifter.py .ci/phase69/tiny.ppc.bin \
             --raw --base 0x10000 --functions .ci/phase69/functions.json \
             --jobs 1 --single-file --output "$D/Generated" > "$D/lift.log" 2>&1
           test -s "$D/Generated/ppu_recomp.c"
-          test -s "$D/Generated/ppu_recomp.h"
-          grep -Fq 'ps3_indirect_call(ctx);' "$D/Generated/ppu_recomp.c"
-          echo 'SOURCE_PREPARED=YES' > "$D/prepare-result.txt"
+          test -s "$D/Generated/ppu_recomp.h" || { echo 'PHASE71_GENERATED_HEADER_MISSING' | tee -a "$D/prepare-result.txt"; exit 1; }
+          test -s "$D/Generated/ppu_recomp.c" || { echo 'PHASE71_GENERATED_CODE_MISSING' | tee -a "$D/prepare-result.txt"; exit 1; }
+          grep -Fq 'ps3_indirect_call(ctx);' "$D/Generated/ppu_recomp.c" || { echo 'PHASE71_INDIRECT_DISPATCH_NOT_IN_LIFT' | tee -a "$D/prepare-result.txt"; exit 1; }
+          echo 'SOURCE_PREPARED=YES' | tee -a "$D/prepare-result.txt"
 
       - name: Compilar objetos del loader original y las funciones recompiladas
         shell: bash
