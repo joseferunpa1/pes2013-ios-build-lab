@@ -10,55 +10,75 @@ jobs:
     steps:
       - name: Descargar repositorio
         uses: actions/checkout@v4
-      - name: Preparar el toolkit fijo y XcodeGen
+
+      - name: Preparar toolkit y registrar arquitectura del runner
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p build/phase65
           xcodebuild -version > build/phase65/xcode.txt
           xcrun --sdk iphonesimulator --show-sdk-version >> build/phase65/xcode.txt
+          printf 'RUNNER_ARCH=%s\n' "$(uname -m)" | tee build/phase65/architecture.txt
+          printf 'RUNNER_OS=%s\n' "$(sw_vers -productVersion)" | tee -a build/phase65/architecture.txt
           git clone --quiet https://github.com/erikomis/ps3recomp.git toolkit
           git -C toolkit checkout --quiet 675ed394
           git clone --quiet --depth 1 https://github.com/erikomis/pes2013-recomp.git pes2013-upstream
           git -C toolkit apply ../pes2013-upstream/patches/ps3recomp-675ed39-pes13.patch
           if ! command -v xcodegen >/dev/null 2>&1; then brew install xcodegen; fi
-      - name: Compilar modulo sysPrxForUser de produccion
+
+      - name: Compilar HLE de produccion en ambas arquitecturas de simulador
         shell: bash
         run: |
           set -euo pipefail
           D="$PWD/build/phase65"
           SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
-          if xcrun --sdk iphonesimulator clang \
-            -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
-            -std=gnu11 -fblocks -ffunction-sections -fdata-sections -fvisibility=hidden -c \
-            -I toolkit/include -I toolkit/include/ps3emu \
-            -I toolkit/libs/video -I toolkit/libs/input -I toolkit/libs/system \
-            -I toolkit/runtime -I toolkit/runtime/spu -I toolkit/runtime/ppu \
-            toolkit/libs/system/sysPrxForUser.c -o "$D/sysPrxForUser.o" \
-            > "$D/compile.log" 2>&1; then
-            echo 'PRODUCTION_HLE_COMPILE_EXIT_CODE=0' | tee "$D/compile-result.txt"
-          else
-            CODE=$?
-            echo "PRODUCTION_HLE_COMPILE_EXIT_CODE=$CODE" | tee "$D/compile-result.txt"
-            tail -n 60 "$D/compile.log" || true
-            exit "$CODE"
-          fi
-          xcrun ar rcs "$D/libsysprx65.a" "$D/sysPrxForUser.o"
-          xcrun nm -g "$D/sysPrxForUser.o" > "$D/hle-symbols.txt" 2>&1 || true
-          grep ' _sys_process_getpid$' "$D/hle-symbols.txt" || { echo 'HLE function absent'; exit 1; }
-          echo 'Only sysPrxForUser.c is linked from production code. No guest title function is executed.' > "$D/scope.txt"
+          for ARCH in arm64 x86_64; do
+            echo "COMPILING_SYS_PRX_FOR_USER_ARCH=$ARCH" | tee -a "$D/architecture.txt"
+            if xcrun --sdk iphonesimulator clang \
+                -target "${ARCH}-apple-ios16.0-simulator" -isysroot "$SDK" \
+                -std=gnu11 -fblocks -ffunction-sections -fdata-sections -fvisibility=hidden -c \
+                -I toolkit/include -I toolkit/include/ps3emu \
+                -I toolkit/libs/video -I toolkit/libs/input -I toolkit/libs/system \
+                -I toolkit/runtime -I toolkit/runtime/spu -I toolkit/runtime/ppu \
+                toolkit/libs/system/sysPrxForUser.c -o "$D/sysPrxForUser-${ARCH}.o" \
+                > "$D/compile-${ARCH}.log" 2>&1; then
+              echo "PRODUCTION_HLE_COMPILE_${ARCH}=0" | tee -a "$D/compile-result.txt"
+            else
+              CODE=$?
+              echo "PRODUCTION_HLE_COMPILE_${ARCH}=$CODE" | tee -a "$D/compile-result.txt"
+              tail -n 60 "$D/compile-${ARCH}.log" || true
+              exit "$CODE"
+            fi
+            xcrun ar rcs "$D/libsysprx65-${ARCH}.a" "$D/sysPrxForUser-${ARCH}.o"
+            xcrun nm -g "$D/sysPrxForUser-${ARCH}.o" > "$D/hle-symbols-${ARCH}.txt" 2>&1
+            grep ' _sys_process_getpid$' "$D/hle-symbols-${ARCH}.txt" || { echo "HLE symbol absent for $ARCH"; exit 1; }
+            grep ' _sys_lwmutex_reset_all$' "$D/hle-symbols-${ARCH}.txt" || { echo "Mutex reset absent for $ARCH"; exit 1; }
+          done
+          xcrun lipo -create \
+            "$D/libsysprx65-arm64.a" "$D/libsysprx65-x86_64.a" \
+            -output "$D/libsysprx65.a"
+          xcrun lipo -info "$D/libsysprx65.a" | tee -a "$D/architecture.txt"
+          echo 'Only original sysPrxForUser.c is linked as production HLE; no PS3 game code runs.' > "$D/scope.txt"
+
       - name: Compilar aplicacion UIKit + VM + HLE + Metal
         shell: bash
         run: |
           set -euo pipefail
           D="$PWD/build/phase65"
+          HOST_ARCH="$(uname -m)"
+          case "$HOST_ARCH" in
+            arm64|x86_64) ;;
+            *) echo "UNSUPPORTED_RUNNER_ARCH=$HOST_ARCH" | tee -a "$D/architecture.txt"; exit 1 ;;
+          esac
+          echo "XCODE_SIMULATOR_ARCH=$HOST_ARCH" | tee -a "$D/architecture.txt"
           cd .ci/phase65
           xcodegen generate --spec project.yml
           set +e
           xcodebuild -project HLEProbe.xcodeproj -scheme HLEProbe -configuration Debug \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath "$GITHUB_WORKSPACE/build/Phase65DerivedData" \
-            CODE_SIGNING_ALLOWED=NO build > "$D/build.log" 2>&1
+            "ARCHS=$HOST_ARCH" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO build \
+            > "$D/build.log" 2>&1
           CODE=$?
           set -e
           echo "APP_BUILD_EXIT_CODE=$CODE" | tee "$D/app-build-result.txt"
@@ -66,6 +86,7 @@ jobs:
             grep -n -E 'error:|Undefined symbols|ld:' "$D/build.log" | tail -n 60 || true
             exit "$CODE"
           fi
+
       - name: Ejecutar prueba en simulador iPhone
         shell: bash
         timeout-minutes: 10
@@ -98,6 +119,7 @@ jobs:
           grep -q '^PRODUCTION_HLE_GETPID=1001 EXPECTED=1001$' "$D/report.txt"
           grep -q '^GUEST_ENDIAN_READ32=OK$' "$D/report.txt"
           grep -q '^PHASE65_PASS$' "$D/report.txt"
+
       - name: Publicar todos los diagnosticos
         if: always()
         uses: actions/upload-artifact@v4
