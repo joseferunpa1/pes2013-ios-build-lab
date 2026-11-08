@@ -43,8 +43,8 @@ jobs:
           grep -q 'func_00010020' "$D/lifted-ppu.c"
           grep -q 'func_00010040' "$D/lifted-ppu.c"
           grep -q 'func_00010080' "$D/lifted-ppu.c"
-          grep -q 'func_000100a0' "$D/lifted-ppu.c"
-          grep -q 'func_000100e0' "$D/lifted-ppu.c"
+          grep -q 'func_000100A0' "$D/lifted-ppu.c"
+          grep -q 'func_000100E0' "$D/lifted-ppu.c"
           cp .ci/phase69/opcodes.txt "$D/opcodes.txt"
           if grep -E '/\* TODO|unhandled operands' "$D/lifted-ppu.c" > "$D/unhandled.txt"; then
             echo 'LIFT_UNHANDLED_INSTRUCTIONS=YES'; exit 1
@@ -58,8 +58,16 @@ jobs:
           sed -n '/^void func_00010080(/,/^}/p' "$D/lifted-ppu.c" > "$D/lifted-callee-excerpt.txt"
           test -s "$D/lifted-caller-excerpt.txt"
           test -s "$D/lifted-callee-excerpt.txt"
-          sed -n '/^void func_000100a0(/,/^}/p' "$D/lifted-ppu.c" > "$D/lifted-indirect-excerpt.txt"
+          sed -n '/^void func_000100A0(/,/^}/p' "$D/lifted-ppu.c" > "$D/lifted-indirect-excerpt.txt"
           test -s "$D/lifted-indirect-excerpt.txt"
+          # Confirm the actual lowering of mtctr r12 + bctrl, rather than
+          # accepting an arbitrary function with the expected address.
+          grep -Fq 'ctx->ctr = ctx->gpr[12];' "$D/lifted-indirect-excerpt.txt" || {
+            echo 'PPC_MTCTR_LOWERING_NOT_FOUND' >&2; exit 1;
+          }
+          grep -Fq 'ps3_indirect_call(ctx);' "$D/lifted-indirect-excerpt.txt" || {
+            echo 'PPC_BCTRL_DISPATCH_NOT_FOUND' >&2; exit 1;
+          }
           grep -Eq 'func_00010080\(ctx\)' "$D/lifted-caller-excerpt.txt" || {
             echo 'PPC_DIRECT_CALL_NOT_FOUND_IN_GENERATED_CODE' >&2
             exit 1
