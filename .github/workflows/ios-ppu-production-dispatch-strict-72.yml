@@ -1,0 +1,138 @@
+name: Fase 72 - intentar enlace final del despachador PPU real
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  production-dispatch-strict:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Obtener archivos del laboratorio
+        uses: actions/checkout@v4
+
+      - name: Preparar toolkit anclado y funciones PowerPC sinteticas
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$GITHUB_WORKSPACE/build/phase72"
+          mkdir -p "$D/Generated"
+          printf 'RUNNER_ARCH=%s\n' "$(uname -m)" > "$D/environment.txt"
+          xcodebuild -version > "$D/xcode.txt"
+          xcrun --sdk iphonesimulator --show-sdk-version >> "$D/xcode.txt"
+          # functions.json y tiny.ppc.bin se generan, NO se almacenan en Git.
+          if [ ! -f .ci/phase69/generate_guest.py ]; then
+            echo 'PHASE72_MISSING_GENERATOR=.ci/phase69/generate_guest.py' | tee "$D/prepare-result.txt"
+            exit 1
+          fi
+          python3 .ci/phase69/generate_guest.py > "$D/guest-generation.txt" 2> "$D/guest-generation-error.log"
+          test -s .ci/phase69/functions.json || { echo 'PHASE72_FUNCTIONS_JSON_MISSING_AFTER_GENERATION' | tee "$D/prepare-result.txt"; exit 1; }
+          test -s .ci/phase69/tiny.ppc.bin || { echo 'PHASE72_PPC_BINARY_MISSING_AFTER_GENERATION' | tee "$D/prepare-result.txt"; exit 1; }
+          echo 'PHASE72_GUEST_INPUT_GENERATED=YES' | tee "$D/prepare-result.txt"
+          git clone --quiet https://github.com/erikomis/ps3recomp.git toolkit
+          git -C toolkit checkout --quiet 675ed394
+          git clone --quiet --depth 1 https://github.com/erikomis/pes2013-recomp.git pes2013-upstream
+          git -C toolkit apply ../pes2013-upstream/patches/ps3recomp-675ed39-pes13.patch
+          test -f toolkit/runtime/ppu/ppu_loader.cpp
+          python3 toolkit/tools/ppu_lifter.py .ci/phase69/tiny.ppc.bin \
+            --raw --base 0x10000 --functions .ci/phase69/functions.json \
+            --jobs 1 --single-file --output "$D/Generated" > "$D/lift.log" 2>&1
+          test -s "$D/Generated/ppu_recomp.c"
+          test -s "$D/Generated/ppu_recomp.h" || { echo 'PHASE72_GENERATED_HEADER_MISSING' | tee -a "$D/prepare-result.txt"; exit 1; }
+          test -s "$D/Generated/ppu_recomp.c" || { echo 'PHASE72_GENERATED_CODE_MISSING' | tee -a "$D/prepare-result.txt"; exit 1; }
+          grep -Fq 'ps3_indirect_call(ctx);' "$D/Generated/ppu_recomp.c" || { echo 'PHASE72_INDIRECT_DISPATCH_NOT_IN_LIFT' | tee -a "$D/prepare-result.txt"; exit 1; }
+          echo 'SOURCE_PREPARED=YES' | tee -a "$D/prepare-result.txt"
+
+      - name: Compilar cargador, funciones recompiladas, gestor VM y programa real de prueba
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$GITHUB_WORKSPACE/build/phase72"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          FAILED=0
+          : > "$D/compile-result.txt"
+          for ARCH in arm64 x86_64; do
+            COMMON=(-target "${ARCH}-apple-ios16.0-simulator" -isysroot "$SDK" \
+              -std=c++17 -fblocks -ffunction-sections -fdata-sections \
+              -I "$D/Generated" -I toolkit/include -I toolkit/include/ps3emu \
+              -I toolkit/runtime -I toolkit/runtime/ppu -I toolkit/runtime/memory \
+              -I toolkit/runtime/platform -I toolkit/libs/system \
+              -I toolkit/libs/video -I toolkit/libs/input)
+            xcrun --sdk iphonesimulator clang++ "${COMMON[@]}" \
+              -c toolkit/runtime/ppu/ppu_loader.cpp -o "$D/loader-${ARCH}.o" \
+              > "$D/loader-compile-${ARCH}.log" 2>&1
+            A=$?
+            xcrun --sdk iphonesimulator clang++ "${COMMON[@]}" \
+              -x c++ -c "$D/Generated/ppu_recomp.c" -o "$D/guest-${ARCH}.o" \
+              > "$D/guest-compile-${ARCH}.log" 2>&1
+            B=$?
+            xcrun --sdk iphonesimulator clang \
+              -target "${ARCH}-apple-ios16.0-simulator" -isysroot "$SDK" \
+              -std=gnu11 -ffunction-sections -fdata-sections \
+              -c .ci/runtime/ios_guest_vm.c -o "$D/vm-${ARCH}.o" \
+              > "$D/vm-compile-${ARCH}.log" 2>&1
+            C=$?
+            xcrun --sdk iphonesimulator clang++ "${COMMON[@]}" \
+              -c .ci/phase72/production_dispatch_probe.cpp -o "$D/probe-${ARCH}.o" \
+              > "$D/probe-compile-${ARCH}.log" 2>&1
+            E=$?
+            printf 'ARCH=%s LOADER=%s GUEST=%s VM=%s PROBE=%s\n' "$ARCH" "$A" "$B" "$C" "$E" \
+              | tee -a "$D/compile-result.txt"
+            if [ "$A" -ne 0 ] || [ "$B" -ne 0 ] || [ "$C" -ne 0 ] || [ "$E" -ne 0 ]; then FAILED=1; fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            echo 'PHASE72_COMPILE_INCOMPLETE' | tee -a "$D/compile-result.txt"
+            for f in "$D"/*compile*.log; do grep -n -m 12 -E 'error:|fatal error:' "$f" || true; done
+            exit 1
+          fi
+          echo 'PHASE72_COMPILE_PASS' | tee -a "$D/compile-result.txt"
+
+      - name: Intentar enlace final estricto eliminando secciones no utilizadas
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$GITHUB_WORKSPACE/build/phase72"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          FAILED=0
+          : > "$D/strict-result.txt"
+          for ARCH in arm64 x86_64; do
+            xcrun --sdk iphonesimulator clang++ \
+              -target "${ARCH}-apple-ios16.0-simulator" -isysroot "$SDK" \
+              -Wl,-dead_strip -Wl,-undefined,error \
+              "$D/probe-${ARCH}.o" "$D/loader-${ARCH}.o" \
+              "$D/guest-${ARCH}.o" "$D/vm-${ARCH}.o" \
+              -o "$D/production-dispatch-${ARCH}" \
+              > "$D/strict-link-${ARCH}.log" 2>&1
+            CODE=$?
+            printf 'PHASE72_STRICT_LINK_%s=%s\n' "$ARCH" "$CODE" | tee -a "$D/strict-result.txt"
+            if [ "$CODE" -eq 0 ]; then
+              file "$D/production-dispatch-${ARCH}" > "$D/executable-${ARCH}.txt"
+              xcrun nm -g -u "$D/production-dispatch-${ARCH}" > "$D/remaining-${ARCH}.txt" 2>&1 || true
+              echo "PHASE72_LINKED_${ARCH}=YES" | tee -a "$D/strict-result.txt"
+            else
+              FAILED=1
+              echo "PHASE72_LINKED_${ARCH}=NO" | tee -a "$D/strict-result.txt"
+              grep -A 120 -E 'Undefined symbols|ld:|error:' "$D/strict-link-${ARCH}.log" \
+                | head -150 > "$D/link-errors-${ARCH}.txt" || true
+            fi
+          done
+          printf '%s\n' \
+            'The test references the ORIGINAL ppu_recomp_register and ps3_indirect_call in ppu_loader.cpp.' \
+            'A successful link is not proof of execution or behavioral correctness.' \
+            'This job does not run an iOS process. No PES 2013 code or RSX is used.' \
+            'No fabricated symbols or -undefined dynamic_lookup options are used.' \
+            > "$D/scope.txt"
+          if [ "$FAILED" -ne 0 ]; then
+            echo 'PHASE72_STRICT_LINK_NEEDS_RUNTIME_DEPS' | tee -a "$D/strict-result.txt"
+            exit 1
+          fi
+          echo 'PHASE72_STRICT_LINK_PASS' | tee -a "$D/strict-result.txt"
+
+      - name: Guardar diagnosticos aun si falla el enlace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pes2013-ios-production-dispatch-strict-phase72
+          path: build/phase72/
+          if-no-files-found: warn
+          retention-days: 7
