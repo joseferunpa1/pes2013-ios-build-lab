@@ -1,0 +1,181 @@
+name: Fase 67 - comprobar bifurcaciones y memoria PPU levantada
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  hle-simulator:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar toolkit y registrar arquitectura del runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/phase67
+          xcodebuild -version > build/phase67/xcode.txt
+          xcrun --sdk iphonesimulator --show-sdk-version >> build/phase67/xcode.txt
+          printf 'RUNNER_ARCH=%s\n' "$(uname -m)" | tee build/phase67/architecture.txt
+          printf 'RUNNER_OS=%s\n' "$(sw_vers -productVersion)" | tee -a build/phase67/architecture.txt
+          git clone --quiet https://github.com/erikomis/ps3recomp.git toolkit
+          git -C toolkit checkout --quiet 675ed394
+          git clone --quiet --depth 1 https://github.com/erikomis/pes2013-recomp.git pes2013-upstream
+          git -C toolkit apply ../pes2013-upstream/patches/ps3recomp-675ed39-pes13.patch
+          if ! command -v xcodegen >/dev/null 2>&1; then brew install xcodegen; fi
+
+      - name: Levantar instrucciones PPU originales de prueba con el lifter del toolkit
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$PWD/build/phase67"
+          python3 .ci/phase67/generate_guest.py | tee "$D/guest-input.txt"
+          mkdir -p .ci/phase67/LiftProbe/Generated
+          python3 toolkit/tools/ppu_lifter.py .ci/phase67/tiny.ppc.bin \
+            --raw --base 0x10000 --functions .ci/phase67/functions.json \
+            --jobs 1 --single-file --output .ci/phase67/LiftProbe/Generated \
+            > "$D/lift.log" 2>&1
+          cp .ci/phase67/LiftProbe/Generated/ppu_recomp.c "$D/lifted-ppu.c"
+          cp .ci/phase67/LiftProbe/Generated/ppu_recomp.h "$D/lifted-ppu.h"
+          grep -q 'func_00010000' "$D/lifted-ppu.c"
+          grep -q 'func_00010020' "$D/lifted-ppu.c"
+          cp .ci/phase67/opcodes.txt "$D/opcodes.txt"
+          if grep -E '/\* TODO|unhandled operands' "$D/lifted-ppu.c" > "$D/unhandled.txt"; then
+            echo 'LIFT_UNHANDLED_INSTRUCTIONS=YES'; exit 1
+          fi
+          echo 'LIFTER_OUTPUT_GENERATED=YES' | tee "$D/lift-result.txt"
+          sed -n '/^void func_00010000(/,/^}/p' "$D/lifted-ppu.c" > "$D/lifted-branch-excerpt.txt"
+          sed -n '/^void func_00010020(/,/^}/p' "$D/lifted-ppu.c" > "$D/lifted-memory-excerpt.txt"
+          test -s "$D/lifted-branch-excerpt.txt"
+          test -s "$D/lifted-memory-excerpt.txt"
+          # Upstream emits C++ declarations (extern "C") even though its filename is .c.
+          # Keep the unmodified generated C in the diagnostics and compile a .cpp copy.
+          test -s toolkit/runtime/ppu/ppu_vmx.h
+          mv .ci/phase67/LiftProbe/Generated/ppu_recomp.c .ci/phase67/LiftProbe/Generated/ppu_recomp.cpp
+          echo 'GENERATED_CPP_UNIT=YES' | tee -a "$D/lift-result.txt"
+          # Independent syntax check before invoking XcodeGen/Xcode.
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          set +e
+          xcrun --sdk iphonesimulator clang++ \
+            -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+            -std=c++17 -fsyntax-only \
+            -I .ci/phase67/LiftProbe/Generated -I toolkit/runtime/ppu \
+            .ci/phase67/LiftProbe/Generated/ppu_recomp.cpp \
+            > "$D/generated-cpp-syntax.log" 2>&1
+          SYNTAX_CODE=$?
+          set -e
+          echo "GENERATED_CPP_SYNTAX_EXIT_CODE=$SYNTAX_CODE" | tee -a "$D/lift-result.txt"
+          if [ "$SYNTAX_CODE" -ne 0 ]; then
+            tail -n 65 "$D/generated-cpp-syntax.log" || true
+            exit "$SYNTAX_CODE"
+          fi
+
+      - name: Compilar HLE de produccion en ambas arquitecturas de simulador
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$PWD/build/phase67"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          for ARCH in arm64 x86_64; do
+            echo "COMPILING_SYS_PRX_FOR_USER_ARCH=$ARCH" | tee -a "$D/architecture.txt"
+            if xcrun --sdk iphonesimulator clang \
+                -target "${ARCH}-apple-ios16.0-simulator" -isysroot "$SDK" \
+                -std=gnu11 -fblocks -ffunction-sections -fdata-sections -fvisibility=hidden -c \
+                -I toolkit/include -I toolkit/include/ps3emu \
+                -I toolkit/libs/video -I toolkit/libs/input -I toolkit/libs/system \
+                -I toolkit/runtime -I toolkit/runtime/spu -I toolkit/runtime/ppu \
+                toolkit/libs/system/sysPrxForUser.c -o "$D/sysPrxForUser-${ARCH}.o" \
+                > "$D/compile-${ARCH}.log" 2>&1; then
+              echo "PRODUCTION_HLE_COMPILE_${ARCH}=0" | tee -a "$D/compile-result.txt"
+            else
+              CODE=$?
+              echo "PRODUCTION_HLE_COMPILE_${ARCH}=$CODE" | tee -a "$D/compile-result.txt"
+              tail -n 60 "$D/compile-${ARCH}.log" || true
+              exit "$CODE"
+            fi
+            xcrun ar rcs "$D/libsysprx67-${ARCH}.a" "$D/sysPrxForUser-${ARCH}.o"
+            xcrun nm -g "$D/sysPrxForUser-${ARCH}.o" > "$D/hle-symbols-${ARCH}.txt" 2>&1
+            grep ' _sys_process_getpid$' "$D/hle-symbols-${ARCH}.txt" || { echo "HLE symbol absent for $ARCH"; exit 1; }
+            grep ' _sys_lwmutex_reset_all$' "$D/hle-symbols-${ARCH}.txt" || { echo "Mutex reset absent for $ARCH"; exit 1; }
+          done
+          xcrun lipo -create \
+            "$D/libsysprx67-arm64.a" "$D/libsysprx67-x86_64.a" \
+            -output "$D/libsysprx67.a"
+          xcrun lipo -info "$D/libsysprx67.a" | tee -a "$D/architecture.txt"
+          echo 'Uses original sysPrxForUser.c and two synthetic PPC functions translated by ps3recomp; no PES game code or RSX init.' > "$D/scope.txt"
+
+      - name: Compilar aplicacion UIKit + VM + HLE + Metal
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$PWD/build/phase67"
+          HOST_ARCH="$(uname -m)"
+          case "$HOST_ARCH" in
+            arm64|x86_64) ;;
+            *) echo "UNSUPPORTED_RUNNER_ARCH=$HOST_ARCH" | tee -a "$D/architecture.txt"; exit 1 ;;
+          esac
+          echo "XCODE_SIMULATOR_ARCH=$HOST_ARCH" | tee -a "$D/architecture.txt"
+          cd .ci/phase67
+          xcodegen generate --spec project.yml
+          set +e
+          xcodebuild -project LiftProbe.xcodeproj -scheme LiftProbe -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$GITHUB_WORKSPACE/build/Phase67DerivedData" \
+            "ARCHS=$HOST_ARCH" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO build \
+            > "$D/build.log" 2>&1
+          CODE=$?
+          set -e
+          echo "APP_BUILD_EXIT_CODE=$CODE" | tee "$D/app-build-result.txt"
+          if [ "$CODE" -ne 0 ]; then
+            grep -n -E 'error:|Undefined symbols|ld:' "$D/build.log" | tail -n 60 || true
+            exit "$CODE"
+          fi
+
+      - name: Ejecutar prueba en simulador iPhone
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          D="$PWD/build/phase67"
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import sys,json
+          items=json.load(sys.stdin)["devices"]
+          opts=[(int("18-5" in k),int(d.get("name")=="iPhone 16"),d["udid"]) for k,v in items.items() if "iOS" in k for d in v if d.get("isAvailable",True) and d.get("name","").startswith("iPhone")]
+          if not opts: sys.exit("NO_AVAILABLE_IPHONE_SIMULATOR")
+          print(sorted(opts,reverse=True)[0][2])
+          ')
+          echo "UDID=$UDID" | tee "$D/simulator.txt"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          APP="$PWD/build/Phase67DerivedData/Build/Products/Debug-iphonesimulator/LiftProbe.app"
+          BUNDLE=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Info.plist")
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl launch "$UDID" "$BUNDLE" | tee "$D/launch.txt"
+          sleep 20
+          xcrun simctl io "$UDID" screenshot "$D/screenshot.png" || true
+          APPDATA=$(xcrun simctl get_app_container "$UDID" "$BUNDLE" data)
+          if [ -s "$APPDATA/Documents/phase67-report.txt" ]; then
+            cp "$APPDATA/Documents/phase67-report.txt" "$D/report.txt"
+          else
+            echo 'REPORT_NOT_FOUND' | tee "$D/report.txt"
+          fi
+          cat "$D/report.txt"
+          grep -q '^PRODUCTION_HLE_GETPID=1001 EXPECTED=1001$' "$D/report.txt"
+          grep -q '^GUEST_ENDIAN_READ32=OK$' "$D/report.txt"
+          grep -q '^PPC_BRANCH_ZERO_OUTPUT=0 EXPECTED=0$' "$D/report.txt"
+          grep -q '^PPC_BRANCH_NONZERO_OUTPUT=42 EXPECTED=42$' "$D/report.txt"
+          grep -q '^PPC_MEMORY_OUTPUT=0x1234567a EXPECTED=0x1234567a$' "$D/report.txt"
+          grep -q '^PPC_MEMORY_STORED=0x12345678 BYTES_BIG_ENDIAN=YES$' "$D/report.txt"
+          grep -q '^PPC_LIFT_FUNCTION_TABLE=OK$' "$D/report.txt"
+          grep -q '^PHASE67_PASS$' "$D/report.txt"
+
+      - name: Publicar todos los diagnosticos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pes2013-ios-ppu-flow-memory-phase67
+          path: build/phase67/
+          if-no-files-found: warn
+          retention-days: 7
