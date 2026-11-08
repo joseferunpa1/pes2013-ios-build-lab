@@ -1,0 +1,30 @@
+name: LiftProbe
+options:
+  bundleIdPrefix: com.pesrecomp
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  LiftProbe:
+    type: application
+    platform: iOS
+    sources:
+      - path: LiftProbe
+      - path: ../runtime/ios_guest_vm.c
+    info:
+      path: LiftProbe/Info.plist
+      properties:
+        UILaunchScreen: {}
+    settings:
+      base:
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1"
+        CLANG_ENABLE_OBJC_ARC: YES
+        GENERATE_INFOPLIST_FILE: YES
+        DEAD_CODE_STRIPPING: YES
+        HEADER_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../../toolkit $(SRCROOT)/../../toolkit/runtime/ppu $(SRCROOT)/LiftProbe/Generated"
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../../build/phase68"
+        OTHER_LDFLAGS: "$(inherited) -lsysprx68 -Wl,-dead_strip"
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: UIKit.framework
