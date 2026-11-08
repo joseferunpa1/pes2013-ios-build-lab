@@ -1,0 +1,274 @@
+name: Fase 73 - probar proveedores reales del despachador PPU
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  production-dispatch-strict:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Obtener archivos del laboratorio
+        uses: actions/checkout@v4
+
+      - name: Preparar toolkit anclado y funciones PowerPC sinteticas
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$GITHUB_WORKSPACE/build/phase72"
+          mkdir -p "$D/Generated"
+          printf 'RUNNER_ARCH=%s\n' "$(uname -m)" > "$D/environment.txt"
+          xcodebuild -version > "$D/xcode.txt"
+          xcrun --sdk iphonesimulator --show-sdk-version >> "$D/xcode.txt"
+          # functions.json y tiny.ppc.bin se generan, NO se almacenan en Git.
+          if [ ! -f .ci/phase69/generate_guest.py ]; then
+            echo 'PHASE72_MISSING_GENERATOR=.ci/phase69/generate_guest.py' | tee "$D/prepare-result.txt"
+            exit 1
+          fi
+          python3 .ci/phase69/generate_guest.py > "$D/guest-generation.txt" 2> "$D/guest-generation-error.log"
+          test -s .ci/phase69/functions.json || { echo 'PHASE72_FUNCTIONS_JSON_MISSING_AFTER_GENERATION' | tee "$D/prepare-result.txt"; exit 1; }
+          test -s .ci/phase69/tiny.ppc.bin || { echo 'PHASE72_PPC_BINARY_MISSING_AFTER_GENERATION' | tee "$D/prepare-result.txt"; exit 1; }
+          echo 'PHASE72_GUEST_INPUT_GENERATED=YES' | tee "$D/prepare-result.txt"
+          git clone --quiet https://github.com/erikomis/ps3recomp.git toolkit
+          git -C toolkit checkout --quiet 675ed394
+          git clone --quiet --depth 1 https://github.com/erikomis/pes2013-recomp.git pes2013-upstream
+          git -C toolkit apply ../pes2013-upstream/patches/ps3recomp-675ed39-pes13.patch
+          test -f toolkit/runtime/ppu/ppu_loader.cpp
+          python3 toolkit/tools/ppu_lifter.py .ci/phase69/tiny.ppc.bin \
+            --raw --base 0x10000 --functions .ci/phase69/functions.json \
+            --jobs 1 --single-file --output "$D/Generated" > "$D/lift.log" 2>&1
+          test -s "$D/Generated/ppu_recomp.c"
+          test -s "$D/Generated/ppu_recomp.h" || { echo 'PHASE72_GENERATED_HEADER_MISSING' | tee -a "$D/prepare-result.txt"; exit 1; }
+          test -s "$D/Generated/ppu_recomp.c" || { echo 'PHASE72_GENERATED_CODE_MISSING' | tee -a "$D/prepare-result.txt"; exit 1; }
+          grep -Fq 'ps3_indirect_call(ctx);' "$D/Generated/ppu_recomp.c" || { echo 'PHASE72_INDIRECT_DISPATCH_NOT_IN_LIFT' | tee -a "$D/prepare-result.txt"; exit 1; }
+          echo 'SOURCE_PREPARED=YES' | tee -a "$D/prepare-result.txt"
+
+      - name: Compilar cargador, funciones recompiladas, gestor VM y programa real de prueba
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$GITHUB_WORKSPACE/build/phase72"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          FAILED=0
+          : > "$D/compile-result.txt"
+          for ARCH in arm64 x86_64; do
+            COMMON=(-target "${ARCH}-apple-ios16.0-simulator" -isysroot "$SDK" \
+              -std=c++17 -fblocks -ffunction-sections -fdata-sections \
+              -I "$D/Generated" -I toolkit/include -I toolkit/include/ps3emu \
+              -I toolkit/runtime -I toolkit/runtime/ppu -I toolkit/runtime/memory \
+              -I toolkit/runtime/platform -I toolkit/libs/system \
+              -I toolkit/libs/video -I toolkit/libs/input)
+            xcrun --sdk iphonesimulator clang++ "${COMMON[@]}" \
+              -c toolkit/runtime/ppu/ppu_loader.cpp -o "$D/loader-${ARCH}.o" \
+              > "$D/loader-compile-${ARCH}.log" 2>&1
+            A=$?
+            xcrun --sdk iphonesimulator clang++ "${COMMON[@]}" \
+              -x c++ -c "$D/Generated/ppu_recomp.c" -o "$D/guest-${ARCH}.o" \
+              > "$D/guest-compile-${ARCH}.log" 2>&1
+            B=$?
+            xcrun --sdk iphonesimulator clang \
+              -target "${ARCH}-apple-ios16.0-simulator" -isysroot "$SDK" \
+              -std=gnu11 -ffunction-sections -fdata-sections \
+              -c .ci/runtime/ios_guest_vm.c -o "$D/vm-${ARCH}.o" \
+              > "$D/vm-compile-${ARCH}.log" 2>&1
+            C=$?
+            xcrun --sdk iphonesimulator clang++ "${COMMON[@]}" \
+              -c .ci/phase72/production_dispatch_probe.cpp -o "$D/probe-${ARCH}.o" \
+              > "$D/probe-compile-${ARCH}.log" 2>&1
+            E=$?
+            printf 'ARCH=%s LOADER=%s GUEST=%s VM=%s PROBE=%s\n' "$ARCH" "$A" "$B" "$C" "$E" \
+              | tee -a "$D/compile-result.txt"
+            if [ "$A" -ne 0 ] || [ "$B" -ne 0 ] || [ "$C" -ne 0 ] || [ "$E" -ne 0 ]; then FAILED=1; fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            echo 'PHASE72_COMPILE_INCOMPLETE' | tee -a "$D/compile-result.txt"
+            for f in "$D"/*compile*.log; do grep -n -m 12 -E 'error:|fatal error:' "$f" || true; done
+            exit 1
+          fi
+          echo 'PHASE72_COMPILE_PASS' | tee -a "$D/compile-result.txt"
+
+      - name: Compilar cuatro proveedores reales del toolkit
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$GITHUB_WORKSPACE/build/phase73"
+          mkdir -p "$D/providers"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          : > "$D/provider-summary.tsv"
+          printf 'architecture\tmodule\tsource\texit_code\n' > "$D/provider-summary.tsv"
+          FAIL=0
+          for NAME in win32_compat cellGcmSys spu_coherency spu_raw; do
+            SOURCE="$(find toolkit -type f -name "${NAME}.c" -print -quit)"
+            if [ -z "$SOURCE" ]; then
+              printf 'all\t%s\tNOT_FOUND\t99\n' "$NAME" >> "$D/provider-summary.tsv"
+              FAIL=1
+              continue
+            fi
+            echo "$SOURCE" > "$D/providers/${NAME}.path.txt"
+            if [ "$NAME" = 'win32_compat' ]; then
+              cp "$SOURCE" "$D/providers/win32_compat.original.c"
+              if ! python3 - "$SOURCE" <<'PY73PATCH'
+          from pathlib import Path
+          import sys
+          p=Path(sys.argv[1])
+          s=p.read_text()
+          # iOS compatibility changes already compiled successfully in Phase 60.
+          changes=[
+              ('#  include <mach/mach_vm.h>', '#  include <mach/vm_map.h>'),
+              ('mach_vm_address_t a = (mach_vm_address_t)addr;', 'vm_address_t a = (vm_address_t)addr;'),
+              ('mach_vm_size_t    sz = 0;', 'vm_size_t    sz = 0;'),
+              ('mach_vm_region(mach_task_self(),', 'vm_region_64(mach_task_self(),'),
+          ]
+          for old,new in changes:
+              if s.count(old) != 1:
+                  raise SystemExit('ERROR: unsupported patch pattern '+repr(old)+' found='+str(s.count(old)))
+              s=s.replace(old,new,1)
+          p.write_text(s)
+          print('PHASE73_MACH_VM_PATCH=APPLIED')
+          PY73PATCH
+              then
+                echo 'PHASE73_MACH_VM_PATCH=FAILED' > "$D/providers/patch-result.txt"
+                FAIL=1
+                continue
+              fi
+              echo 'PHASE73_MACH_VM_PATCH=OK' > "$D/providers/patch-result.txt"
+            fi
+            for ARCH in arm64 x86_64; do
+              TARGET="${ARCH}-apple-ios16.0-simulator"
+              OBJ="$D/providers/${NAME}-${ARCH}.o"
+              LOG="$D/providers/${NAME}-${ARCH}.compile.log"
+              if xcrun --sdk iphonesimulator clang \
+                -target "$TARGET" -isysroot "$SDK" \
+                -std=gnu11 -fblocks -ffunction-sections -fdata-sections \
+                -I toolkit/include -I toolkit/include/ps3emu \
+                -I toolkit/runtime -I toolkit/runtime/ppu -I toolkit/runtime/spu \
+                -I toolkit/runtime/memory -I toolkit/runtime/platform \
+                -I toolkit/libs/video -I toolkit/libs/input -I toolkit/libs/system \
+                -I toolkit/libs/filesystem -I toolkit/libs/network \
+                -c "$SOURCE" -o "$OBJ" > "$LOG" 2>&1; then
+                CODE=0
+                xcrun nm -g -U "$OBJ" > "$D/providers/${NAME}-${ARCH}.definitions.txt" 2>&1 || true
+                xcrun nm -g "$OBJ" > "$D/providers/${NAME}-${ARCH}.symbols.txt" 2>&1 || true
+              else
+                CODE=$?
+                FAIL=1
+              fi
+              printf '%s\t%s\t%s\t%s\n' "$ARCH" "$NAME" "$SOURCE" "$CODE" >> "$D/provider-summary.tsv"
+            done
+          done
+          echo "PHASE73_PROVIDER_COMPILE_FAILURES=$FAIL" > "$D/provider-result.txt"
+          # Keep succeeding so strict-link stage can still generate an actionable report.
+
+      - name: Auditar proveedores por simbolo y buscar ps3_hle_count en fuentes
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$GITHUB_WORKSPACE/build/phase73"
+          python3 - <<'PY73AUDIT'
+          from pathlib import Path
+          import re
+          d=Path('build/phase73')
+          missing=['GetFileAttributesA','cellGcm_ref_on_poll','g_spu_coh_bitmap',
+                   'ppu_hle_inject_base','ps3_hle_count','spu_coh_is_reserved',
+                   'spu_coh_notify_write','spu_lockline_lock','spu_lockline_unlock',
+                   'spu_raw_reg_load','spu_raw_reg_store']
+          out=['symbol\tproviders_defining_symbol_arm64']
+          for name in missing:
+              providers=[]
+              for p in sorted((d/'providers').glob('*-arm64.definitions.txt')):
+                  s=p.read_text(errors='replace')
+                  if re.search(r'(?m)^\S+\s+[A-Z]\s+_'+re.escape(name)+r'\s*$',s):
+                      providers.append(p.name.split('-arm64')[0])
+              out.append(name+'\t'+(';'.join(providers) if providers else 'NOT_IN_FOUR_PROVIDERS'))
+          (d/'symbol-coverage.tsv').write_text('\n'.join(out)+'\n')
+          # Text search only: occurrences are not proof of exported definitions.
+          patterns=['ps3_hle_count','ppu_hle_inject_base']
+          files=[]
+          for p in Path('toolkit').rglob('*'):
+              if p.suffix.lower() not in {'.c','.cpp','.cc','.h','.hpp','.m','.mm'}: continue
+              try:
+                  source=p.read_text(errors='replace')
+              except (OSError,UnicodeError): continue
+              for symbol in patterns:
+                  for n,line in enumerate(source.splitlines(),1):
+                      if re.search(r'\b'+symbol+r'\b',line):
+                          files.append(f'{symbol}\t{p}\t{n}\t{line.strip()[:250]}')
+                          if len(files)>=180: break
+          (d/'source-occurrences.tsv').write_text('symbol\tpath\tline\ttext\n'+'\n'.join(files)+'\n')
+          print((d/'symbol-coverage.tsv').read_text())
+          PY73AUDIT
+
+      - name: Enlazar programa PPU con proveedores reales para ambas arquitecturas
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$GITHUB_WORKSPACE/build/phase73"
+          BASE="$GITHUB_WORKSPACE/build/phase72"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          : > "$D/link-result.txt"
+          FAILED=0
+          for ARCH in arm64 x86_64; do
+            OBJECTS=("$BASE/probe-${ARCH}.o" "$BASE/loader-${ARCH}.o" \
+                     "$BASE/guest-${ARCH}.o" "$BASE/vm-${ARCH}.o")
+            READY=1
+            for NAME in win32_compat cellGcmSys spu_coherency spu_raw; do
+              OBJ="$D/providers/${NAME}-${ARCH}.o"
+              if [ ! -s "$OBJ" ]; then
+                READY=0
+                echo "PROVIDER_MISSING_${ARCH}=${NAME}" >> "$D/link-result.txt"
+              else
+                OBJECTS+=("$OBJ")
+              fi
+            done
+            if [ "$READY" -ne 1 ]; then
+              echo "PHASE73_STRICT_LINK_${ARCH}=SKIPPED_MISSING_PROVIDER" >> "$D/link-result.txt"
+              FAILED=1
+              continue
+            fi
+            if xcrun --sdk iphonesimulator clang++ \
+              -target "${ARCH}-apple-ios16.0-simulator" -isysroot "$SDK" \
+              -Wl,-dead_strip -Wl,-undefined,error \
+              "${OBJECTS[@]}" -o "$D/production-dispatch-${ARCH}" \
+              > "$D/strict-link-${ARCH}.log" 2>&1; then
+              CODE=0
+              file "$D/production-dispatch-${ARCH}" > "$D/executable-${ARCH}.txt"
+              echo "PHASE73_EXECUTABLE_${ARCH}=BUILT_NOT_EXECUTED" >> "$D/link-result.txt"
+            else
+              CODE=$?
+              FAILED=1
+            fi
+            echo "PHASE73_STRICT_LINK_${ARCH}=$CODE" >> "$D/link-result.txt"
+            python3 - "$D/strict-link-${ARCH}.log" "$D/undefined-${ARCH}.txt" <<'PY73ERRORS'
+          from pathlib import Path
+          import re,sys
+          s=Path(sys.argv[1]).read_text(errors='replace')
+          symbols=sorted(set(re.findall(r'^  "(_[^"]+)"',s,re.M)))
+          Path(sys.argv[2]).write_text('\n'.join(symbols)+'\n')
+          print(f'{Path(sys.argv[2]).name}: {len(symbols)} unresolved symbols')
+          PY73ERRORS
+          done
+          printf '%s\n' \
+            'No fake/empty providers: four unmodified production modules plus the previously tested Mach VM API substitution.' \
+            'The provider objects are compiled and linked, not executed in an iOS Simulator.' \
+            'Even a strict-link success does not establish runtime behavior or PES 2013 compatibility.' \
+            > "$D/scope.txt"
+          if [ "$FAILED" -ne 0 ]; then
+            echo 'PHASE73_LINK_INCOMPLETE=YES' | tee -a "$D/link-result.txt"
+            exit 1
+          fi
+          echo 'PHASE73_STRICT_LINK_PASS' | tee -a "$D/link-result.txt"
+
+      - name: Guardar diagnosticos incluso si falla alguna compilacion o enlace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pes2013-ios-production-providers-phase73
+          path: |
+            build/phase72/prepare-result.txt
+            build/phase72/compile-result.txt
+            build/phase72/guest-generation.txt
+            build/phase72/lift.log
+            build/phase72/*compile*.log
+            build/phase73/
+          if-no-files-found: warn
+          retention-days: 7
