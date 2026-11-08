@@ -1,0 +1,479 @@
+name: Fase 75 - ejecutar dispatcher PPU de produccion en simulador iOS
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  production-dispatch-strict:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - name: Obtener archivos del laboratorio
+        uses: actions/checkout@v4
+
+      - name: Preparar toolkit anclado y funciones PowerPC sinteticas
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$GITHUB_WORKSPACE/build/phase72"
+          mkdir -p "$D/Generated"
+          printf 'RUNNER_ARCH=%s\n' "$(uname -m)" > "$D/environment.txt"
+          xcodebuild -version > "$D/xcode.txt"
+          xcrun --sdk iphonesimulator --show-sdk-version >> "$D/xcode.txt"
+          # functions.json y tiny.ppc.bin se generan, NO se almacenan en Git.
+          if [ ! -f .ci/phase69/generate_guest.py ]; then
+            echo 'PHASE72_MISSING_GENERATOR=.ci/phase69/generate_guest.py' | tee "$D/prepare-result.txt"
+            exit 1
+          fi
+          python3 .ci/phase69/generate_guest.py > "$D/guest-generation.txt" 2> "$D/guest-generation-error.log"
+          test -s .ci/phase69/functions.json || { echo 'PHASE72_FUNCTIONS_JSON_MISSING_AFTER_GENERATION' | tee "$D/prepare-result.txt"; exit 1; }
+          test -s .ci/phase69/tiny.ppc.bin || { echo 'PHASE72_PPC_BINARY_MISSING_AFTER_GENERATION' | tee "$D/prepare-result.txt"; exit 1; }
+          echo 'PHASE72_GUEST_INPUT_GENERATED=YES' | tee "$D/prepare-result.txt"
+          git clone --quiet https://github.com/erikomis/ps3recomp.git toolkit
+          git -C toolkit checkout --quiet 675ed394
+          git clone --quiet --depth 1 https://github.com/erikomis/pes2013-recomp.git pes2013-upstream
+          git -C toolkit apply ../pes2013-upstream/patches/ps3recomp-675ed39-pes13.patch
+          test -f toolkit/runtime/ppu/ppu_loader.cpp
+          python3 toolkit/tools/ppu_lifter.py .ci/phase69/tiny.ppc.bin \
+            --raw --base 0x10000 --functions .ci/phase69/functions.json \
+            --jobs 1 --single-file --output "$D/Generated" > "$D/lift.log" 2>&1
+          test -s "$D/Generated/ppu_recomp.c"
+          test -s "$D/Generated/ppu_recomp.h" || { echo 'PHASE72_GENERATED_HEADER_MISSING' | tee -a "$D/prepare-result.txt"; exit 1; }
+          test -s "$D/Generated/ppu_recomp.c" || { echo 'PHASE72_GENERATED_CODE_MISSING' | tee -a "$D/prepare-result.txt"; exit 1; }
+          grep -Fq 'ps3_indirect_call(ctx);' "$D/Generated/ppu_recomp.c" || { echo 'PHASE72_INDIRECT_DISPATCH_NOT_IN_LIFT' | tee -a "$D/prepare-result.txt"; exit 1; }
+          echo 'SOURCE_PREPARED=YES' | tee -a "$D/prepare-result.txt"
+
+      - name: Compilar cargador, funciones recompiladas, gestor VM y programa real de prueba
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$GITHUB_WORKSPACE/build/phase72"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          FAILED=0
+          : > "$D/compile-result.txt"
+          for ARCH in arm64 x86_64; do
+            COMMON=(-target "${ARCH}-apple-ios16.0-simulator" -isysroot "$SDK" \
+              -std=c++17 -fblocks -ffunction-sections -fdata-sections \
+              -I "$D/Generated" -I toolkit/include -I toolkit/include/ps3emu \
+              -I toolkit/runtime -I toolkit/runtime/ppu -I toolkit/runtime/memory \
+              -I toolkit/runtime/platform -I toolkit/libs/system \
+              -I toolkit/libs/video -I toolkit/libs/input)
+            xcrun --sdk iphonesimulator clang++ "${COMMON[@]}" \
+              -c toolkit/runtime/ppu/ppu_loader.cpp -o "$D/loader-${ARCH}.o" \
+              > "$D/loader-compile-${ARCH}.log" 2>&1
+            A=$?
+            xcrun --sdk iphonesimulator clang++ "${COMMON[@]}" \
+              -x c++ -c "$D/Generated/ppu_recomp.c" -o "$D/guest-${ARCH}.o" \
+              > "$D/guest-compile-${ARCH}.log" 2>&1
+            B=$?
+            xcrun --sdk iphonesimulator clang \
+              -target "${ARCH}-apple-ios16.0-simulator" -isysroot "$SDK" \
+              -std=gnu11 -ffunction-sections -fdata-sections \
+              -c .ci/runtime/ios_guest_vm.c -o "$D/vm-${ARCH}.o" \
+              > "$D/vm-compile-${ARCH}.log" 2>&1
+            C=$?
+            xcrun --sdk iphonesimulator clang++ "${COMMON[@]}" \
+              -c .ci/phase72/production_dispatch_probe.cpp -o "$D/probe-${ARCH}.o" \
+              > "$D/probe-compile-${ARCH}.log" 2>&1
+            E=$?
+            printf 'ARCH=%s LOADER=%s GUEST=%s VM=%s PROBE=%s\n' "$ARCH" "$A" "$B" "$C" "$E" \
+              | tee -a "$D/compile-result.txt"
+            if [ "$A" -ne 0 ] || [ "$B" -ne 0 ] || [ "$C" -ne 0 ] || [ "$E" -ne 0 ]; then FAILED=1; fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            echo 'PHASE72_COMPILE_INCOMPLETE' | tee -a "$D/compile-result.txt"
+            for f in "$D"/*compile*.log; do grep -n -m 12 -E 'error:|fatal error:' "$f" || true; done
+            exit 1
+          fi
+          echo 'PHASE72_COMPILE_PASS' | tee -a "$D/compile-result.txt"
+
+      - name: Compilar cuatro proveedores reales del toolkit
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$GITHUB_WORKSPACE/build/phase73"
+          mkdir -p "$D/providers"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          : > "$D/provider-summary.tsv"
+          printf 'architecture\tmodule\tsource\texit_code\n' > "$D/provider-summary.tsv"
+          FAIL=0
+          for NAME in win32_compat cellGcmSys spu_coherency spu_raw; do
+            SOURCE="$(find toolkit -type f -name "${NAME}.c" -print -quit)"
+            if [ -z "$SOURCE" ]; then
+              printf 'all\t%s\tNOT_FOUND\t99\n' "$NAME" >> "$D/provider-summary.tsv"
+              FAIL=1
+              continue
+            fi
+            echo "$SOURCE" > "$D/providers/${NAME}.path.txt"
+            if [ "$NAME" = 'win32_compat' ]; then
+              cp "$SOURCE" "$D/providers/win32_compat.original.c"
+              if ! python3 - "$SOURCE" <<'PY73PATCH'
+          from pathlib import Path
+          import sys
+          p=Path(sys.argv[1])
+          s=p.read_text()
+          # iOS compatibility changes already compiled successfully in Phase 60.
+          changes=[
+              ('#  include <mach/mach_vm.h>', '#  include <mach/vm_map.h>'),
+              ('mach_vm_address_t a = (mach_vm_address_t)addr;', 'vm_address_t a = (vm_address_t)addr;'),
+              ('mach_vm_size_t    sz = 0;', 'vm_size_t    sz = 0;'),
+              ('mach_vm_region(mach_task_self(),', 'vm_region_64(mach_task_self(),'),
+          ]
+          for old,new in changes:
+              if s.count(old) != 1:
+                  raise SystemExit('ERROR: unsupported patch pattern '+repr(old)+' found='+str(s.count(old)))
+              s=s.replace(old,new,1)
+          p.write_text(s)
+          print('PHASE73_MACH_VM_PATCH=APPLIED')
+          PY73PATCH
+              then
+                echo 'PHASE73_MACH_VM_PATCH=FAILED' > "$D/providers/patch-result.txt"
+                FAIL=1
+                continue
+              fi
+              echo 'PHASE73_MACH_VM_PATCH=OK' > "$D/providers/patch-result.txt"
+            fi
+            for ARCH in arm64 x86_64; do
+              TARGET="${ARCH}-apple-ios16.0-simulator"
+              OBJ="$D/providers/${NAME}-${ARCH}.o"
+              LOG="$D/providers/${NAME}-${ARCH}.compile.log"
+              if xcrun --sdk iphonesimulator clang \
+                -target "$TARGET" -isysroot "$SDK" \
+                -std=gnu11 -fblocks -ffunction-sections -fdata-sections \
+                -I toolkit/include -I toolkit/include/ps3emu \
+                -I toolkit/runtime -I toolkit/runtime/ppu -I toolkit/runtime/spu \
+                -I toolkit/runtime/memory -I toolkit/runtime/platform \
+                -I toolkit/libs/video -I toolkit/libs/input -I toolkit/libs/system \
+                -I toolkit/libs/filesystem -I toolkit/libs/network \
+                -c "$SOURCE" -o "$OBJ" > "$LOG" 2>&1; then
+                CODE=0
+                xcrun nm -g -U "$OBJ" > "$D/providers/${NAME}-${ARCH}.definitions.txt" 2>&1 || true
+                xcrun nm -g "$OBJ" > "$D/providers/${NAME}-${ARCH}.symbols.txt" 2>&1 || true
+              else
+                CODE=$?
+                FAIL=1
+              fi
+              printf '%s\t%s\t%s\t%s\n' "$ARCH" "$NAME" "$SOURCE" "$CODE" >> "$D/provider-summary.tsv"
+            done
+          done
+          echo "PHASE73_PROVIDER_COMPILE_FAILURES=$FAIL" > "$D/provider-result.txt"
+          # Keep succeeding so strict-link stage can still generate an actionable report.
+
+      - name: Auditar proveedores por simbolo y buscar ps3_hle_count en fuentes
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$GITHUB_WORKSPACE/build/phase73"
+          python3 - <<'PY73AUDIT'
+          from pathlib import Path
+          import re
+          d=Path('build/phase73')
+          missing=['GetFileAttributesA','cellGcm_ref_on_poll','g_spu_coh_bitmap',
+                   'ppu_hle_inject_base','ps3_hle_count','spu_coh_is_reserved',
+                   'spu_coh_notify_write','spu_lockline_lock','spu_lockline_unlock',
+                   'spu_raw_reg_load','spu_raw_reg_store']
+          out=['symbol\tproviders_defining_symbol_arm64']
+          for name in missing:
+              providers=[]
+              for p in sorted((d/'providers').glob('*-arm64.definitions.txt')):
+                  s=p.read_text(errors='replace')
+                  if re.search(r'(?m)^\S+\s+[A-Z]\s+_'+re.escape(name)+r'\s*$',s):
+                      providers.append(p.name.split('-arm64')[0])
+              out.append(name+'\t'+(';'.join(providers) if providers else 'NOT_IN_FOUR_PROVIDERS'))
+          (d/'symbol-coverage.tsv').write_text('\n'.join(out)+'\n')
+          # Text search only: occurrences are not proof of exported definitions.
+          patterns=['ps3_hle_count','ppu_hle_inject_base']
+          files=[]
+          for p in Path('toolkit').rglob('*'):
+              if p.suffix.lower() not in {'.c','.cpp','.cc','.h','.hpp','.m','.mm'}: continue
+              try:
+                  source=p.read_text(errors='replace')
+              except (OSError,UnicodeError): continue
+              for symbol in patterns:
+                  for n,line in enumerate(source.splitlines(),1):
+                      if re.search(r'\b'+symbol+r'\b',line):
+                          files.append(f'{symbol}\t{p}\t{n}\t{line.strip()[:250]}')
+                          if len(files)>=180: break
+          (d/'source-occurrences.tsv').write_text('symbol\tpath\tline\ttext\n'+'\n'.join(files)+'\n')
+          print((d/'symbol-coverage.tsv').read_text())
+          PY73AUDIT
+
+      - name: Compilar proveedores SPU y HLE sin modificar sus fuentes
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$GITHUB_WORKSPACE/build/phase74"
+          mkdir -p "$D/providers"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          printf 'architecture\tmodule\tsource\texit_code\n' > "$D/provider-summary.tsv"
+          FAIL=0
+          for NAME in spu_channels spu_workload ppu_hle; do
+            EXT=c
+            if [ "$NAME" = 'ppu_hle' ]; then EXT=cpp; fi
+            SOURCE="$(find toolkit -type f -name "${NAME}.${EXT}" -print -quit)"
+            if [ -z "$SOURCE" ]; then
+              printf 'all\t%s\tNOT_FOUND\t99\n' "$NAME" >> "$D/provider-summary.tsv"
+              FAIL=1
+              continue
+            fi
+            echo "$SOURCE" > "$D/providers/${NAME}.path.txt"
+            for ARCH in arm64 x86_64; do
+              TARGET="${ARCH}-apple-ios16.0-simulator"
+              OBJ="$D/providers/${NAME}-${ARCH}.o"
+              LOG="$D/providers/${NAME}-${ARCH}.compile.log"
+              INCS=(-I toolkit/include -I toolkit/include/ps3emu
+                -I toolkit/runtime -I toolkit/runtime/ppu -I toolkit/runtime/spu
+                -I toolkit/runtime/memory -I toolkit/runtime/platform
+                -I toolkit/libs/video -I toolkit/libs/input -I toolkit/libs/system
+                -I toolkit/libs/filesystem -I toolkit/libs/network
+                -I "$GITHUB_WORKSPACE/build/phase72/Generated")
+              if [ "$EXT" = 'cpp' ]; then
+                COMPILER=clang++
+                LANG=(-std=c++17)
+              else
+                COMPILER=clang
+                LANG=(-std=gnu11)
+              fi
+              if xcrun --sdk iphonesimulator "$COMPILER" \
+                -target "$TARGET" -isysroot "$SDK" \
+                "${LANG[@]}" -fblocks -ffunction-sections -fdata-sections \
+                "${INCS[@]}" -c "$SOURCE" -o "$OBJ" > "$LOG" 2>&1; then
+                CODE=0
+                xcrun nm -g -U "$OBJ" > "$D/providers/${NAME}-${ARCH}.definitions.txt" 2>&1 || true
+                xcrun nm -g "$OBJ" > "$D/providers/${NAME}-${ARCH}.symbols.txt" 2>&1 || true
+              else
+                CODE=$?
+                FAIL=1
+              fi
+              printf '%s\t%s\t%s\t%s\n' "$ARCH" "$NAME" "$SOURCE" "$CODE" >> "$D/provider-summary.tsv"
+            done
+          done
+          echo "PHASE74_PROVIDER_COMPILE_FAILURES=$FAIL" > "$D/provider-result.txt"
+          for f in "$D/providers"/*.compile.log; do
+            if grep -q 'error:' "$f"; then echo "=== $f ==="; grep -n -m 8 'error:' "$f" || true; fi
+          done
+
+      - name: Comparar enlace estricto SPU solo frente a SPU mas HLE
+        shell: bash
+        run: |
+          set -uo pipefail
+          D="$GITHUB_WORKSPACE/build/phase74"
+          BASE="$GITHUB_WORKSPACE/build/phase72"
+          PREV="$GITHUB_WORKSPACE/build/phase73/providers"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          printf 'architecture\tmode\tstatus\tundefined_count\n' > "$D/link-summary.tsv"
+          FAILED=0
+          for ARCH in arm64 x86_64; do
+            for MODE in spu_only spu_hle; do
+              OBJECTS=("$BASE/probe-${ARCH}.o" "$BASE/loader-${ARCH}.o"
+                       "$BASE/guest-${ARCH}.o" "$BASE/vm-${ARCH}.o")
+              READY=1
+              for NAME in win32_compat cellGcmSys spu_coherency spu_raw; do
+                OBJ="$PREV/${NAME}-${ARCH}.o"
+                if [ ! -s "$OBJ" ]; then READY=0; else OBJECTS+=("$OBJ"); fi
+              done
+              for NAME in spu_channels spu_workload; do
+                OBJ="$D/providers/${NAME}-${ARCH}.o"
+                if [ ! -s "$OBJ" ]; then READY=0; else OBJECTS+=("$OBJ"); fi
+              done
+              if [ "$MODE" = spu_hle ]; then
+                OBJ="$D/providers/ppu_hle-${ARCH}.o"
+                if [ ! -s "$OBJ" ]; then READY=0; else OBJECTS+=("$OBJ"); fi
+              fi
+              LOG="$D/link-${ARCH}-${MODE}.log"
+              UNDEF="$D/undefined-${ARCH}-${MODE}.txt"
+              if [ "$READY" -ne 1 ]; then
+                STATUS=SKIPPED_MISSING_OBJECT
+                echo 'Required object missing; see provider-summary.tsv' > "$LOG"
+                : > "$UNDEF"
+                FAILED=1
+              else
+                if xcrun --sdk iphonesimulator clang++ \
+                  -target "${ARCH}-apple-ios16.0-simulator" -isysroot "$SDK" \
+                  -Wl,-dead_strip -Wl,-undefined,error \
+                  "${OBJECTS[@]}" -o "$D/production-dispatch-${ARCH}-${MODE}" > "$LOG" 2>&1; then
+                  STATUS=0
+                  file "$D/production-dispatch-${ARCH}-${MODE}" > "$D/executable-${ARCH}-${MODE}.txt"
+                else
+                  STATUS=$?
+                  FAILED=1
+                fi
+                python3 - "$LOG" "$UNDEF" <<'PY74SYM'
+          from pathlib import Path
+          import re,sys
+          s=Path(sys.argv[1]).read_text(errors='replace')
+          names=sorted(set(re.findall(r'^\s*"(_[^"\n]+)"\s*,\s*referenced from:',s,re.M)))
+          # Also accept plain ld listing and avoid counting framework diagnostics as symbols.
+          if not names:
+              names=sorted(set(re.findall(r'^\s*"(_[^"\n]+)"',s,re.M)))
+          Path(sys.argv[2]).write_text('\n'.join(names)+('\n' if names else ''))
+          print(f'LINK_UNDEFINED={len(names)} {Path(sys.argv[2]).name}')
+          PY74SYM
+              fi
+              COUNT="$(grep -cve '^$' "$UNDEF" || true)"
+              printf '%s\t%s\t%s\t%s\n' "$ARCH" "$MODE" "$STATUS" "$COUNT" >> "$D/link-summary.tsv"
+            done
+          done
+          python3 - <<'PY74REPORT'
+          from pathlib import Path
+          d=Path('build/phase74')
+          targets=['g_spu_force_ch_block','spu_ch_wake','spu_workload_find_img',
+                   'spu_workload_fingerprint','ps3_hle_count']
+          lines=['symbol\tproducer\tarm64_compiled_definition']
+          for symbol in targets:
+              candidates=[]
+              for p in (d/'providers').glob('*-arm64.definitions.txt'):
+                  if f'_{symbol}' in p.read_text(errors='replace').split():
+                      candidates.append(p.name.split('-arm64')[0])
+              lines.append('\t'.join((symbol,','.join(sorted(candidates)) or 'NOT_EXPORTED','YES' if candidates else 'NO')))
+          (d/'symbol-coverage.tsv').write_text('\n'.join(lines)+'\n')
+          report=(d/'link-summary.tsv').read_text()+'\n'+(d/'symbol-coverage.tsv').read_text()
+          report+='\nSTATIC LINK ONLY. No program executed; no PS3 game code used.\n'
+          (d/'evaluation.txt').write_text(report)
+          print(report)
+          PY74REPORT
+          # The spu_only failure is EXPECTED in this A/B test. Only spu_hle is required.
+          python3 - <<'PY75LINK'
+          from pathlib import Path
+          import csv
+          d=Path('build/phase74')
+          with (d/'link-summary.tsv').open() as f:
+              rows=list(csv.DictReader(f, delimiter='\t'))
+          for arch in ('arm64','x86_64'):
+              matching=[r for r in rows if r['architecture']==arch and r['mode']=='spu_hle']
+              if len(matching)!=1 or matching[0]['status']!='0' or matching[0]['undefined_count']!='0':
+                  raise SystemExit('PHASE75_PREREQUISITE_LINK_FAILED_'+arch)
+          (d/'result.txt').write_text('PHASE74_SPU_HLE_STRICT_LINK_PASS=YES\nPHASE74_SPU_ONLY_EXPECTED_FAILURE=YES\n')
+          print('PHASE75_PREREQUISITE_STRICT_LINK_PASS')
+          PY75LINK
+
+      - name: Construir app iOS con dispatcher original y prueba PPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$GITHUB_WORKSPACE/build/phase75"
+          BASE="$GITHUB_WORKSPACE/build/phase72"
+          PREV="$GITHUB_WORKSPACE/build/phase73/providers"
+          ADD="$GITHUB_WORKSPACE/build/phase74/providers"
+          mkdir -p "$D/ProductionDispatch75.app"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          ARCH="$(uname -m)"
+          case "$ARCH" in arm64|x86_64) ;; *) echo "UNSUPPORTED_RUNNER_ARCH=$ARCH"; exit 1;; esac
+          printf 'RUNNER_ARCH=%s\n' "$ARCH" > "$D/architecture.txt"
+          TARGET="${ARCH}-apple-ios16.0-simulator"
+          # Compile production test main under a different name, so UIKit owns app main.
+          xcrun --sdk iphonesimulator clang++ -target "$TARGET" -isysroot "$SDK" \
+            -std=c++17 -fblocks -ffunction-sections -fdata-sections -Dmain=phase72_probe_main \
+            -I "$BASE/Generated" -I toolkit/include -I toolkit/include/ps3emu \
+            -I toolkit/runtime -I toolkit/runtime/ppu -I toolkit/runtime/memory \
+            -I toolkit/runtime/platform -I toolkit/libs/system -I toolkit/libs/video -I toolkit/libs/input \
+            -c .ci/phase72/production_dispatch_probe.cpp -o "$D/probe-entry.o" \
+            > "$D/probe-entry-compile.log" 2>&1
+          xcrun --sdk iphonesimulator clang++ -target "$TARGET" -isysroot "$SDK" \
+            -std=c++17 -fobjc-arc -fblocks -fobjc-exceptions -x objective-c++ \
+            -c .ci/phase75/ProductionApp.mm -o "$D/app-main.o" \
+            > "$D/app-main-compile.log" 2>&1
+          OBJECTS=("$D/app-main.o" "$D/probe-entry.o" \
+            "$BASE/loader-${ARCH}.o" "$BASE/guest-${ARCH}.o" "$BASE/vm-${ARCH}.o")
+          for NAME in win32_compat cellGcmSys spu_coherency spu_raw; do
+            OBJECTS+=("$PREV/${NAME}-${ARCH}.o")
+          done
+          for NAME in spu_channels spu_workload ppu_hle; do
+            OBJECTS+=("$ADD/${NAME}-${ARCH}.o")
+          done
+          EXE="$D/ProductionDispatch75.app/ProductionDispatch75"
+          xcrun --sdk iphonesimulator clang++ -target "$TARGET" -isysroot "$SDK" \
+            -Wl,-dead_strip -Wl,-undefined,error \
+            "${OBJECTS[@]}" -framework Foundation -framework UIKit \
+            -o "$EXE" > "$D/app-link.log" 2>&1
+          python3 - "$D/ProductionDispatch75.app/Info.plist" <<'PY75PLIST'
+          import plistlib,sys
+          d={
+             'CFBundleIdentifier':'com.pesrecomp.ProductionDispatch75',
+             'CFBundleExecutable':'ProductionDispatch75',
+             'CFBundleName':'ProductionDispatch75',
+             'CFBundleDisplayName':'PPU Dispatch Probe',
+             'CFBundlePackageType':'APPL',
+             'CFBundleShortVersionString':'1.0',
+             'CFBundleVersion':'1',
+             'CFBundleDevelopmentRegion':'en',
+             'LSRequiresIPhoneOS':True,
+             'MinimumOSVersion':'16.0',
+             'UIDeviceFamily':[1,2],
+             'UIRequiresFullScreen':True,
+          }
+          with open(sys.argv[1],'wb') as f:plistlib.dump(d,f)
+          PY75PLIST
+          file "$EXE" | tee "$D/app-file.txt"
+          (xcrun vtool -show-build "$EXE" || true) > "$D/app-platform.txt" 2>&1
+          echo 'PHASE75_APP_LINK_PASS' | tee "$D/app-result.txt"
+          codesign --force --sign - --timestamp=none "$D/ProductionDispatch75.app" \
+            > "$D/codesign.log" 2>&1
+
+      - name: Ejecutar dispatcher de produccion dentro del simulador
+        shell: bash
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          D="$GITHUB_WORKSPACE/build/phase75"
+          UDID="$(xcrun simctl list devices available -j | python3 -c '
+          import sys,json
+          devices=json.load(sys.stdin)["devices"]
+          options=[]
+          for runtime, lst in devices.items():
+              if "iOS" not in runtime: continue
+              for dev in lst:
+                  if dev.get("isAvailable", True) and dev.get("name", "").startswith("iPhone"):
+                      options.append((int("18-5" in runtime),int("iPhone 16" in dev["name"]),dev["udid"]))
+          if not options: sys.exit("NO_AVAILABLE_IPHONE_SIMULATOR")
+          print(sorted(options,reverse=True)[0][2])
+          ')"
+          echo "SIMULATOR_UDID=$UDID" | tee "$D/simulator.txt"
+          xcrun simctl boot "$UDID" > "$D/simulator-boot.log" 2>&1 || true
+          xcrun simctl bootstatus "$UDID" -b >> "$D/simulator-boot.log" 2>&1
+          xcrun simctl install "$UDID" "$D/ProductionDispatch75.app" \
+            > "$D/install.log" 2>&1
+          # Launch can return even if the app's probe later fails. Read the report directly.
+          xcrun simctl launch "$UDID" com.pesrecomp.ProductionDispatch75 \
+            > "$D/launch.txt" 2>&1 || true
+          REPORT_FOUND=NO
+          for attempt in $(seq 1 35); do
+            APPDATA="$(xcrun simctl get_app_container "$UDID" com.pesrecomp.ProductionDispatch75 data 2>/dev/null || true)"
+            if [ -n "$APPDATA" ] && [ -f "$APPDATA/Documents/phase75-report.txt" ]; then
+              cp "$APPDATA/Documents/phase75-report.txt" "$D/runtime-report.txt"
+              if grep -q 'PHASE75_RUNTIME_' "$D/runtime-report.txt"; then REPORT_FOUND=YES; break; fi
+            fi
+            sleep 2
+          done
+          xcrun simctl io "$UDID" screenshot "$D/screenshot.png" > "$D/screenshot.log" 2>&1 || true
+          echo "RUNTIME_REPORT_FOUND=$REPORT_FOUND" > "$D/runtime-result.txt"
+          if [ "$REPORT_FOUND" != YES ]; then
+            tail -n 100 "$D/runtime-report.txt" 2>/dev/null || true
+            echo 'PHASE75_RUNTIME_REPORT_MISSING_OR_TIMEOUT'
+            exit 1
+          fi
+          cat "$D/runtime-report.txt"
+          if ! grep -q '^PHASE72_RUNTIME_PASS$' "$D/runtime-report.txt" || \
+             ! grep -q '^PHASE75_RUNTIME_PASS$' "$D/runtime-report.txt"; then
+            echo 'PHASE75_RUNTIME_TEST_FAILED' | tee -a "$D/runtime-result.txt"
+            exit 1
+          fi
+          echo 'PHASE75_PASS' | tee -a "$D/runtime-result.txt"
+      - name: Guardar todos los diagnosticos aunque falle la compilacion o el enlace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pes2013-ios-production-dispatch-execution-phase75
+          path: |
+            build/phase72/prepare-result.txt
+            build/phase72/compile-result.txt
+            build/phase72/guest-generation.txt
+            build/phase72/lift.log
+            build/phase72/*compile*.log
+            build/phase73/provider-summary.tsv
+            build/phase73/provider-result.txt
+            build/phase73/providers/
+            build/phase74/
+            build/phase75/
+          if-no-files-found: warn
+          retention-days: 7
