@@ -22,8 +22,8 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         DEAD_CODE_STRIPPING: YES
         HEADER_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../../toolkit $(SRCROOT)/../../toolkit/runtime/ppu $(SRCROOT)/LiftProbe/Generated"
-        LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../../build/phase66"
-        OTHER_LDFLAGS: "$(inherited) -lsysprx66 -Wl,-dead_strip"
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../../build/phase67"
+        OTHER_LDFLAGS: "$(inherited) -lsysprx67 -Wl,-dead_strip"
     dependencies:
       - sdk: Metal.framework
       - sdk: MetalKit.framework
