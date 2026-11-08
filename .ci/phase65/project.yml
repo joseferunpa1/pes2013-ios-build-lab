@@ -1,0 +1,30 @@
+name: HLEProbe
+options:
+  bundleIdPrefix: com.pesrecomp
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  HLEProbe:
+    type: application
+    platform: iOS
+    sources:
+      - path: HLEProbe
+      - path: ../runtime/ios_guest_vm.c
+    info:
+      path: HLEProbe/Info.plist
+      properties:
+        UILaunchScreen: {}
+    settings:
+      base:
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1"
+        CLANG_ENABLE_OBJC_ARC: YES
+        GENERATE_INFOPLIST_FILE: YES
+        DEAD_CODE_STRIPPING: YES
+        HEADER_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../../toolkit"
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../../build/phase65"
+        OTHER_LDFLAGS: "$(inherited) -lsysprx65 -Wl,-dead_strip"
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: UIKit.framework

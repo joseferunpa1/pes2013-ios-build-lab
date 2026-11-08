@@ -1,0 +1,108 @@
+name: Fase 65 - ejecutar HLE real con memoria PS3 y Metal en simulador
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  hle-simulator:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+      - name: Preparar el toolkit fijo y XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/phase65
+          xcodebuild -version > build/phase65/xcode.txt
+          xcrun --sdk iphonesimulator --show-sdk-version >> build/phase65/xcode.txt
+          git clone --quiet https://github.com/erikomis/ps3recomp.git toolkit
+          git -C toolkit checkout --quiet 675ed394
+          git clone --quiet --depth 1 https://github.com/erikomis/pes2013-recomp.git pes2013-upstream
+          git -C toolkit apply ../pes2013-upstream/patches/ps3recomp-675ed39-pes13.patch
+          if ! command -v xcodegen >/dev/null 2>&1; then brew install xcodegen; fi
+      - name: Compilar modulo sysPrxForUser de produccion
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$PWD/build/phase65"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          if xcrun --sdk iphonesimulator clang \
+            -target arm64-apple-ios16.0-simulator -isysroot "$SDK" \
+            -std=gnu11 -fblocks -ffunction-sections -fdata-sections -fvisibility=hidden -c \
+            -I toolkit/include -I toolkit/include/ps3emu \
+            -I toolkit/libs/video -I toolkit/libs/input -I toolkit/libs/system \
+            -I toolkit/runtime -I toolkit/runtime/spu -I toolkit/runtime/ppu \
+            toolkit/libs/system/sysPrxForUser.c -o "$D/sysPrxForUser.o" \
+            > "$D/compile.log" 2>&1; then
+            echo 'PRODUCTION_HLE_COMPILE_EXIT_CODE=0' | tee "$D/compile-result.txt"
+          else
+            CODE=$?
+            echo "PRODUCTION_HLE_COMPILE_EXIT_CODE=$CODE" | tee "$D/compile-result.txt"
+            tail -n 60 "$D/compile.log" || true
+            exit "$CODE"
+          fi
+          xcrun ar rcs "$D/libsysprx65.a" "$D/sysPrxForUser.o"
+          xcrun nm -g "$D/sysPrxForUser.o" > "$D/hle-symbols.txt" 2>&1 || true
+          grep ' _sys_process_getpid$' "$D/hle-symbols.txt" || { echo 'HLE function absent'; exit 1; }
+          echo 'Only sysPrxForUser.c is linked from production code. No guest title function is executed.' > "$D/scope.txt"
+      - name: Compilar aplicacion UIKit + VM + HLE + Metal
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$PWD/build/phase65"
+          cd .ci/phase65
+          xcodegen generate --spec project.yml
+          set +e
+          xcodebuild -project HLEProbe.xcodeproj -scheme HLEProbe -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$GITHUB_WORKSPACE/build/Phase65DerivedData" \
+            CODE_SIGNING_ALLOWED=NO build > "$D/build.log" 2>&1
+          CODE=$?
+          set -e
+          echo "APP_BUILD_EXIT_CODE=$CODE" | tee "$D/app-build-result.txt"
+          if [ "$CODE" -ne 0 ]; then
+            grep -n -E 'error:|Undefined symbols|ld:' "$D/build.log" | tail -n 60 || true
+            exit "$CODE"
+          fi
+      - name: Ejecutar prueba en simulador iPhone
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          D="$PWD/build/phase65"
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import sys,json
+          items=json.load(sys.stdin)["devices"]
+          opts=[(int("18-5" in k),int(d.get("name")=="iPhone 16"),d["udid"]) for k,v in items.items() if "iOS" in k for d in v if d.get("isAvailable",True) and d.get("name","").startswith("iPhone")]
+          if not opts: sys.exit("NO_AVAILABLE_IPHONE_SIMULATOR")
+          print(sorted(opts,reverse=True)[0][2])
+          ')
+          echo "UDID=$UDID" | tee "$D/simulator.txt"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          APP="$PWD/build/Phase65DerivedData/Build/Products/Debug-iphonesimulator/HLEProbe.app"
+          BUNDLE=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Info.plist")
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl launch "$UDID" "$BUNDLE" | tee "$D/launch.txt"
+          sleep 20
+          xcrun simctl io "$UDID" screenshot "$D/screenshot.png" || true
+          APPDATA=$(xcrun simctl get_app_container "$UDID" "$BUNDLE" data)
+          if [ -s "$APPDATA/Documents/phase65-report.txt" ]; then
+            cp "$APPDATA/Documents/phase65-report.txt" "$D/report.txt"
+          else
+            echo 'REPORT_NOT_FOUND' | tee "$D/report.txt"
+          fi
+          cat "$D/report.txt"
+          grep -q '^PRODUCTION_HLE_GETPID=1001 EXPECTED=1001$' "$D/report.txt"
+          grep -q '^GUEST_ENDIAN_READ32=OK$' "$D/report.txt"
+          grep -q '^PHASE65_PASS$' "$D/report.txt"
+      - name: Publicar todos los diagnosticos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pes2013-ios-hle-execution-phase65
+          path: build/phase65/
+          if-no-files-found: warn
+          retention-days: 7
